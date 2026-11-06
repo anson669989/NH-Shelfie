@@ -1,5 +1,5 @@
 // A5：downloadCover 的實際流程（Capacitor 外掛以假的檔案系統取代，不需要手機）。
-// 涵蓋：資料夾不存在、資料夾已存在、寫檔失敗、主機輪替與記住上次成功的主機、3 秒間隔。
+// 涵蓋：資料夾不存在、資料夾已存在、寫檔失敗、主機輪替與記住上次成功的主機、圖片隊伍 1 秒間隔、兩條隊伍互不卡住。
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 
 const SERVERS = ['https://t1.nhentai.net', 'https://t2.nhentai.net', 'https://t3.nhentai.net', 'https://t4.nhentai.net']
@@ -141,14 +141,14 @@ describe('downloadCover', () => {
     expect(trace.attempts[0].message).toContain('ENOENT')
   })
 
-  it('主機輪替：t1、t2 連不上 → t3 成功；每次間隔 ≥ 3 秒；記住 t3，下次先用 t3', async () => {
+  it('主機輪替：t1、t2 連不上 → t3 成功；每次間隔 ≥ 1 秒；記住 t3，下次先用 t3', async () => {
     fsState.failHosts.add('https://t1.nhentai.net')
     fsState.failHosts.add('https://t2.nhentai.net')
     const res = await settle(nh.downloadCover(1, META, 'preview/1.tmp'))
     expect(res.url.startsWith('https://t3.nhentai.net/')).toBe(true)
     const downloads = fsState.calls.filter((c) => c.op === 'download')
     expect(downloads.map((c) => new URL(c.url).hostname)).toEqual(['t1.nhentai.net', 't2.nhentai.net', 't3.nhentai.net'])
-    for (let i = 1; i < downloads.length; i++) expect(downloads[i].at - downloads[i - 1].at).toBeGreaterThanOrEqual(3000)
+    for (let i = 1; i < downloads.length; i++) expect(downloads[i].at - downloads[i - 1].at).toBeGreaterThanOrEqual(1000)
     expect(settings.cdn_last_host).toBe('https://t3.nhentai.net')
     expect(nh.getLastCoverTrace().attempts.map((a) => a.error ?? 'ok')).toEqual(['OFFLINE', 'OFFLINE', 'ok'])
 
@@ -170,10 +170,51 @@ describe('downloadCover', () => {
     ])
   })
 
-  it('下載前的請求間隔：連續兩次 downloadCover 也至少相隔 3 秒', async () => {
+  it('圖片隊伍間隔：連續兩次 downloadCover 至少相隔 1 秒', async () => {
     await settle(nh.downloadCover(1, META, 'preview/1.tmp'))
     await settle(nh.downloadCover(2, META, 'preview/2.tmp'))
     const d = fsState.calls.filter((c) => c.op === 'download')
-    expect(d[1].at - d[0].at).toBeGreaterThanOrEqual(3000)
+    expect(d[1].at - d[0].at).toBeGreaterThanOrEqual(1000)
+  })
+
+  it('四台都失敗 → /api/v2/cdn 快取過期（下次重新取得），舊清單保留當備援', async () => {
+    for (const s of SERVERS) fsState.failHosts.add(s)
+    await expect(settle(nh.downloadCover(1, META, 'preview/1.tmp'))).rejects.toBeTruthy()
+    const c = JSON.parse(settings.cdn_cache)
+    expect(c.at).toBe(0)
+    expect(c.servers).toEqual(SERVERS)
+  })
+
+  it('寫檔失敗不讓 cdn 快取過期（不是主機問題）', async () => {
+    fsState.downloadError = DEV10_MESSAGE
+    await expect(settle(nh.downloadCover(1, META, 'preview/1.tmp'))).rejects.toBeTruthy()
+    expect(JSON.parse(settings.cdn_cache).at).toBeGreaterThan(0)
+  })
+})
+
+describe('兩條隊伍互不卡住', () => {
+  it('封面下載進行中，API 隊伍的詳情查詢不必等它', async () => {
+    const { CapacitorHttp } = await import('@capacitor/core')
+    const json = JSON.parse(
+      (await import('node:fs')).readFileSync(new URL('./fixtures/gallery-api-v2.json', import.meta.url), 'utf8'),
+    )
+    CapacitorHttp.get.mockImplementation(async () => ({ status: 200, headers: { 'content-type': 'application/json' }, data: json }))
+    // 讓封面下載卡住 10 秒
+    let release
+    const origDownload = Filesystem.downloadFile
+    Filesystem.downloadFile = async (opts) => {
+      await new Promise((r) => (release = r))
+      return origDownload(opts)
+    }
+    try {
+      const cover = nh.downloadCover(1, META, 'preview/1.tmp')
+      await vi.advanceTimersByTimeAsync(100)
+      const detail = await settle(nh.fetchDetail(228922))
+      expect(detail.meta.mediaId).toBe('1205270')
+      release()
+      await settle(cover)
+    } finally {
+      Filesystem.downloadFile = origDownload
+    }
   })
 })

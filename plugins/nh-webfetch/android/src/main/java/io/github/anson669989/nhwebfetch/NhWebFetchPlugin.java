@@ -3,6 +3,7 @@ package io.github.anson669989.nhwebfetch;
 import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.Dialog;
+import android.content.Intent;
 import android.content.pm.PackageInfo;
 import android.graphics.Color;
 import android.net.Uri;
@@ -56,6 +57,10 @@ import java.util.regex.Pattern;
  * - 抓取目標 url 只接受 https + nhentai 網域。
  *
  * 所有 WebView 操作都在主執行緒進行（plugin 方法本身在背景執行緒被呼叫）。
+ *
+ * 另外負責接收瀏覽器「分享」進來的文字（ACTION_SEND text/plain；intent-filter 由 scripts/patch-android.mjs 加到
+ * MainActivity）：冷啟動時在 load() 讀 Activity 的 Intent，App 已在背景時由 handleOnNewIntent 接收並發出
+ * shareReceived 事件；JS 端以 takeSharedText() 取出（取出即清除，不會重複處理）。
  */
 @CapacitorPlugin(name = "NhWebFetch")
 public class NhWebFetchPlugin extends Plugin {
@@ -107,6 +112,58 @@ public class NhWebFetchPlugin extends Plugin {
         String probeTitle = "";
         String readyTitle;
         String stage = "probe";
+    }
+
+    // ------------------------------------------------------------------ 分享
+    private static final int MAX_SHARE_CHARS = 4096;
+    private String pendingShare;
+
+    @Override
+    public void load() {
+        super.load();
+        Activity activity = getActivity();
+        if (activity != null) captureShare(activity.getIntent(), false);
+    }
+
+    @Override
+    protected void handleOnNewIntent(Intent intent) {
+        super.handleOnNewIntent(intent);
+        captureShare(intent, true);
+    }
+
+    private void captureShare(Intent intent, boolean notify) {
+        if (intent == null || !Intent.ACTION_SEND.equals(intent.getAction())) return;
+        String type = intent.getType();
+        if (type == null || !type.startsWith("text/")) return;
+        StringBuilder sb = new StringBuilder();
+        CharSequence text = intent.getCharSequenceExtra(Intent.EXTRA_TEXT);
+        if (text != null) sb.append(text);
+        String subject = intent.getStringExtra(Intent.EXTRA_SUBJECT);
+        if (subject != null) {
+            if (sb.length() > 0) sb.append(' ');
+            sb.append(subject);
+        }
+        // 標記為已處理：Activity 重建（例如旋轉螢幕）時不會再讀到同一筆分享
+        intent.setAction(Intent.ACTION_MAIN);
+        if (sb.length() == 0) return;
+        String value = sb.length() > MAX_SHARE_CHARS ? sb.substring(0, MAX_SHARE_CHARS) : sb.toString();
+        synchronized (this) {
+            pendingShare = value;
+        }
+        if (notify) notifyListeners("shareReceived", new JSObject(), true);
+    }
+
+    /** 取出並清除尚未處理的分享文字；沒有時 text 為空字串。 */
+    @PluginMethod
+    public void takeSharedText(PluginCall call) {
+        String value;
+        synchronized (this) {
+            value = pendingShare;
+            pendingShare = null;
+        }
+        JSObject ret = new JSObject();
+        ret.put("text", value == null ? "" : value);
+        call.resolve(ret);
     }
 
     // ------------------------------------------------------------------ API

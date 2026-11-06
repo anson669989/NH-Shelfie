@@ -1,7 +1,7 @@
 {
   "name": "nh-shelfie",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "NH 本地收藏管理器：在手機本地管理收藏的 gallery ID 與封面，不經任何自建伺服器。",
   "type": "module",
   "scripts": {

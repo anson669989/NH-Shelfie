@@ -1,25 +1,48 @@
 // 純函式：不碰網路、資料庫與 Capacitor，方便單元測試。
 import { AppError, E } from './errors.js'
 
-/**
- * 解析使用者輸入：接受 1–7 位正整數，或含 /g/{id} 的網址。
- * @returns {number|null}
- */
-export function parseGalleryId(input) {
-  if (input == null) return null
-  const s = String(input).trim()
-  if (!s) return null
-  let digits = null
-  if (/^\d+$/.test(s)) {
-    digits = s
-  } else {
-    const m = s.match(/\/g\/(\d+)(?:[/?#]|$)/i)
-    if (m) digits = m[1]
-  }
+/** 全形數字、全形＃ → 半形，方便後續比對 */
+function toHalfWidth(s) {
+  return String(s).replace(/[０-９＃]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0))
+}
+
+function toId(digits) {
   if (!digits || digits.length > 7) return null
   const n = Number.parseInt(digits, 10)
   if (!Number.isSafeInteger(n) || n <= 0) return null
   return n
+}
+
+/**
+ * 解析使用者輸入：接受 1–7 位正整數、`#228922`／`# 228922`／全形＃，或含 /g/{id} 的網址。
+ * @returns {number|null}
+ */
+export function parseGalleryId(input) {
+  if (input == null) return null
+  const s = toHalfWidth(input).trim()
+  if (!s) return null
+  let m = s.match(/^#?\s*(\d+)$/)
+  if (m) return toId(m[1])
+  m = s.match(/\/g\/(\d+)(?:[/?#]|$)/i)
+  return m ? toId(m[1]) : null
+}
+
+/**
+ * 從分享進來的一段文字找出第一個 gallery ID（依出現位置取最前面的一個）。
+ * 認得：/g/{id} 網址、#123456、或整段只有數字。
+ * @returns {number|null}
+ */
+export function extractGalleryId(text) {
+  if (text == null) return null
+  const s = toHalfWidth(text)
+  if (/^\s*#?\s*\d+\s*$/.test(s)) return parseGalleryId(s)
+  const re = /\/g\/(\d{1,7})(?=[/?#\s]|$)|#\s?(\d{1,7})(?!\d)/gi
+  let m
+  while ((m = re.exec(s))) {
+    const id = toId(m[1] || m[2])
+    if (id) return id
+  }
+  return null
 }
 
 /** 只以整數 / 純數字字串套範本組網址，避免拼出意外網址。 */
@@ -86,6 +109,7 @@ export function parseGallery(json, rawFormat = 'api-v1') {
   const t = json.title || {}
   const title = pickStr(t.pretty) || pickStr(t.english) || pickStr(t.japanese) || ''
   const titleJa = pickStr(t.japanese) || ''
+  const titleEn = pickStr(t.english) || ''
 
   const tags = Array.isArray(json.tags)
     ? json.tags
@@ -101,6 +125,7 @@ export function parseGallery(json, rawFormat = 'api-v1') {
     coverPath,
     title,
     titleJa,
+    titleEn,
     tags,
   }
 }

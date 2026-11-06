@@ -1,11 +1,12 @@
 // 服務層：介面只和這裡講話；這裡是唯一碰資料庫、檔案與網路（經 nhSource）的地方。
-import { ref } from 'vue'
+import { reactive, ref } from 'vue'
 import { Capacitor } from '@capacitor/core'
 import { Filesystem, Directory, Encoding } from '@capacitor/filesystem'
 import { Share } from '@capacitor/share'
 import { initDb, query, run, transaction } from './db.js'
 import { AppError, E, toAppError } from './errors.js'
-import { classifyDownloadError, normalizeFolderName, parseGallery } from './parse.js'
+import { classifyDownloadError, extractGalleryId, normalizeFolderName, parseGallery } from './parse.js'
+import { planAdd } from './addPlan.js'
 import { buildCsv, validateCsv, CSV_MAX_BYTES } from './csv.js'
 import { loadSettings, migrateSettings, setSetting, settings } from './settings.js'
 import {
@@ -19,6 +20,8 @@ import {
   clearSession,
   getLastDetailTrace,
   getLastCoverTrace,
+  takeSharedText,
+  onShareReceived,
 } from './nhSource.js'
 
 const COVERS_DIR = 'covers'
@@ -29,6 +32,14 @@ const RESERVED_NAMES = new Set(['全部', '未分類', 'all', 'uncategorized', '
 export const dataVersion = ref(0)
 export const pendingCount = ref(0)
 export const queueRunning = ref(false)
+/**
+ * 背景佇列狀態（介面顯示提示用）：
+ * apiWaitUntil／imgWaitUntil：因 429 暫停到何時（毫秒）；netWaitUntil：網路失敗，稍後自動重試；
+ * challenge：需要使用者完成網站驗證；error：需要使用者處理的錯誤碼（寫檔失敗、空間不足…）
+ */
+export const queueState = reactive({ apiWaitUntil: 0, imgWaitUntil: 0, netWaitUntil: 0, challenge: false, error: null })
+/** 從瀏覽器分享進來的內容：{ id: number|null, at }；id 為 null 代表內容裡找不到 ID */
+export const sharedInput = ref(null)
 const bump = () => dataVersion.value++
 
 let dataBaseSrc = ''
@@ -126,13 +137,15 @@ export async function getBookFolders(id) {
 }
 
 const SORT_SQL = {
-  added_desc: 'b.added_at DESC, b.gallery_id DESC',
-  added_asc: 'b.added_at ASC, b.gallery_id ASC',
+  added_desc: 'b.added_at DESC, COALESCE(b.queue_seq, 0) DESC, b.gallery_id DESC',
+  added_asc: 'b.added_at ASC, COALESCE(b.queue_seq, 0) ASC, b.gallery_id ASC',
   id_desc: 'b.gallery_id DESC',
   id_asc: 'b.gallery_id ASC',
   title: "CASE WHEN b.title = '' THEN 1 ELSE 0 END, b.title COLLATE NOCASE ASC, b.gallery_id ASC",
 }
 export const SORT_MODES = Object.keys(SORT_SQL)
+
+const LIST_COLS = 'b.gallery_id, b.title, b.cover_path, b.cover_rev, b.fetch_status'
 
 /**
  * 列表查詢只取顯示欄位（raw_json 在獨立的 book_raw 表）。
@@ -140,38 +153,90 @@ export const SORT_MODES = Object.keys(SORT_SQL)
  */
 export async function listBooks(folderKey, sortMode) {
   const order = SORT_SQL[sortMode] || SORT_SQL.added_desc
-  const cols = 'b.gallery_id, b.title, b.cover_path, b.cover_rev, b.fetch_status'
-  if (folderKey === 'all') return query(`SELECT ${cols} FROM books b ORDER BY ${order}`)
+  if (folderKey === 'all') return query(`SELECT ${LIST_COLS} FROM books b ORDER BY ${order}`)
   if (folderKey === 'uncat')
     return query(
-      `SELECT ${cols} FROM books b WHERE NOT EXISTS (SELECT 1 FROM book_folders bf WHERE bf.gallery_id = b.gallery_id) ORDER BY ${order}`,
+      `SELECT ${LIST_COLS} FROM books b WHERE NOT EXISTS (SELECT 1 FROM book_folders bf WHERE bf.gallery_id = b.gallery_id) ORDER BY ${order}`,
     )
   return query(
-    `SELECT ${cols} FROM books b JOIN book_folders bf ON bf.gallery_id = b.gallery_id WHERE bf.folder_id = ? ORDER BY ${order}`,
+    `SELECT ${LIST_COLS} FROM books b JOIN book_folders bf ON bf.gallery_id = b.gallery_id WHERE bf.folder_id = ? ORDER BY ${order}`,
     [Number(folderKey)],
   )
 }
 
+/** 加入頁「最近加入」：只取顯示欄位 */
+export async function listRecentBooks(limit = 20) {
+  return query(`SELECT ${LIST_COLS} FROM books b ORDER BY ${SORT_SQL.added_desc} LIMIT ?`, [
+    Math.max(1, Math.min(100, Math.trunc(limit))),
+  ])
+}
+
+/** 背景佇列的排隊順序：毫秒時間，保證遞增 */
+let lastSeq = 0
+function nextSeq() {
+  lastSeq = Math.max(Date.now(), lastSeq + 1)
+  return lastSeq
+}
+
+function checkId(id) {
+  const n = Math.trunc(Number(id))
+  if (!Number.isSafeInteger(n) || n <= 0 || n > 9_999_999) throw new AppError(E.INVALID_ID)
+  return n
+}
+
 /**
- * 新增頁「查詢」：取得詳情，再把封面原生下載到快取目錄供預覽。
- * 詳情失敗（404、被擋、格式不符…）直接丟錯，不存入。
- * 封面失敗則回傳 cover = null，仍可存入（灰底問號封面）。
+ * 「先存、後查」：按「加入」只做本機動作，不發任何網路請求。
+ * - already：已在所選資料夾 → 不做事
+ * - addFolders：已收藏 → 只補資料夾關聯，不重抓資料與封面
+ * - new：寫入一筆「待補資料」（meta_pending），交給背景佇列；書是否存在於網站由佇列判斷
+ * @returns {Promise<{kind:'new'|'already'|'addFolders', id:number, originalFolders?:string[]}>}
  */
-export async function lookupGallery(id) {
-  if (await getBook(id)) throw new AppError(E.DUPLICATE)
-  const detail = await fetchDetail(id)
-  let cover = null
-  let coverError = null // 封面失敗原因（錯誤碼），預覽頁顯示白話說明；仍可加入收藏
-  try {
-    const tmp = `${PREVIEW_DIR}/${id}-${Date.now()}.tmp`
-    const res = await downloadCover(id, detail.meta, tmp)
-    cover = { cachePath: res.path, ext: res.ext, src: cacheSrc(res.path) }
-  } catch (err) {
-    const e = toAppError(err)
-    if (e.code === E.RATE_LIMITED) throw err
-    coverError = e.code === E.COVER_FAILED && e.cause === E.TIMEOUT ? E.TIMEOUT : e.code
+export async function quickAdd(id, folderIds = []) {
+  id = checkId(id)
+  const existing = await getBook(id)
+  const existingFolders = existing ? await getBookFolders(id) : []
+  const plan = planAdd(existing ? { folderIds: existingFolders.map((f) => f.id) } : null, folderIds)
+  if (plan.kind === 'already') return { kind: 'already', id }
+  if (plan.kind === 'addFolders') {
+    await addBooksToFolders([id], plan.toAdd)
+    return { kind: 'addFolders', id, originalFolders: existingFolders.map((f) => f.name) }
   }
-  return { id, ...detail, cover, coverError }
+  try {
+    await transaction([
+      {
+        statement:
+          "INSERT INTO books(gallery_id, title, title_ja, fetch_status, added_at, queue_seq) VALUES (?, '', '', 'meta_pending', ?, ?)",
+        values: [id, Math.floor(Date.now() / 1000), nextSeq()],
+      },
+      ...folderStatements([id], plan.folderIds),
+    ])
+  } catch (err) {
+    if (/UNIQUE|PRIMARY KEY|constraint/i.test(String(err?.message || err))) throw new AppError(E.DUPLICATE)
+    throw dbError(err)
+  }
+  bump()
+  await refreshPendingCount()
+  kick('meta')
+  return { kind: 'new', id }
+}
+
+/** 資料夾關聯寫入語句；已刪除的資料夾自動略過（只插入仍存在的 folder id） */
+function folderStatements(ids, folderIds) {
+  const out = []
+  for (const id of ids) {
+    for (const fid of folderIds) {
+      out.push({
+        statement: 'INSERT OR IGNORE INTO book_folders(gallery_id, folder_id) SELECT ?, id FROM folders WHERE id = ?',
+        values: [Number(id), Number(fid)],
+      })
+    }
+  }
+  return out
+}
+
+function dbError(err) {
+  const e = toAppError(err)
+  return e.code === E.STORAGE_FULL ? e : new AppError(E.DB_FAILED, { cause: String(err) })
 }
 
 /** 建立收藏封面資料夾（已存在就略過）。 */
@@ -191,8 +256,7 @@ function fileError(err) {
 }
 
 /**
- * 把快取中的封面搬進 covers/。suffix 用於重抓：寫到新檔名，成功後才刪舊檔，
- * 任何一步失敗都不會讓資料庫指向不存在的檔案。
+ * 把快取中的封面搬進 covers/（寫到新檔名），任何一步失敗都不會讓資料庫指向不存在的檔案。
  */
 async function moveCacheToCovers(cachePath, id, ext, suffix = '') {
   await ensureCoversDir()
@@ -211,18 +275,23 @@ async function moveCacheToCovers(cachePath, id, ext, suffix = '') {
   return target
 }
 
-/** 重抓封面成功後：搬到新檔名 → 更新資料庫 → 刪舊檔。 */
-async function replaceCover(id, oldPath, res) {
+/** 封面下載成功後：搬到新檔名 → 更新資料庫 → 刪舊檔。書在下載途中被刪掉時，刪掉新檔。 */
+async function replaceCover(id, res) {
   const path = await moveCacheToCovers(res.path, id, res.ext, `-r${Date.now()}`)
+  let changes = 0
+  let oldPath = null
   try {
-    await run(
+    oldPath = (await getBook(id))?.cover_path ?? null
+    const r = await run(
       "UPDATE books SET cover_path = ?, cover_ext = ?, cover_rev = cover_rev + 1, fetch_status = 'ok' WHERE gallery_id = ?",
       [path, res.ext, id],
     )
+    changes = Number(r?.changes ?? 1)
   } catch (err) {
     await deleteCoverFile(path)
-    throw toAppError(err).code === E.STORAGE_FULL ? toAppError(err) : new AppError(E.DB_FAILED, { cause: String(err) })
+    throw dbError(err)
   }
+  if (!changes) return deleteCoverFile(path)
   if (oldPath && oldPath !== path) await deleteCoverFile(oldPath)
 }
 
@@ -230,107 +299,121 @@ async function deleteCoverFile(path) {
   if (path) await Filesystem.deleteFile({ path, directory: Directory.Data }).catch(() => {})
 }
 
-/**
- * 寫入順序：先存封面檔 → 再在一個交易內寫 books、book_raw、book_folders；
- * 寫庫失敗就刪掉封面檔，不留孤兒檔。
- */
-export async function addBook(lookup, folderIds = []) {
-  const id = lookup.id
-  let coverPath = null
-  if (lookup.cover) coverPath = await moveCacheToCovers(lookup.cover.cachePath, id, lookup.cover.ext)
-  const m = lookup.meta
-  const now = Math.floor(Date.now() / 1000)
-  try {
-    await transaction([
-      {
-        statement:
-          'INSERT INTO books(gallery_id, media_id, title, title_ja, cover_path, cover_ext, cover_rev, note, fetch_status, added_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
-        values: [id, m.mediaId, m.title, m.titleJa, coverPath, lookup.cover?.ext ?? m.coverExt, 0, null, coverPath ? 'ok' : 'no_cover', now],
-      },
-      {
-        statement: 'INSERT INTO book_raw(gallery_id, raw_json, raw_format) VALUES (?,?,?)',
-        values: [id, lookup.rawJson, lookup.rawFormat],
-      },
-      ...folderIds.map((fid) => ({
-        statement: 'INSERT OR IGNORE INTO book_folders(gallery_id, folder_id) VALUES (?,?)',
-        values: [id, Number(fid)],
-      })),
-    ])
-  } catch (err) {
-    await deleteCoverFile(coverPath)
-    if (/UNIQUE|PRIMARY KEY|constraint/i.test(String(err?.message || err))) throw new AppError(E.DUPLICATE)
-    throw toAppError(err).code === E.STORAGE_FULL ? toAppError(err) : new AppError(E.DB_FAILED, { cause: String(err) })
-  }
+/** 批次加入資料夾（只加不移） */
+export async function addBooksToFolders(ids, folderIds) {
+  if (!ids.length || !folderIds.length) return
+  await transaction(folderStatements(ids, folderIds))
   bump()
 }
 
-export async function addBookToFolders(id, folderIds) {
-  if (!folderIds.length) return
+/** 單本的資料夾關聯：勾選結果直接套用（⋮ → 分類） */
+export async function setBookFolders(id, folderIds) {
+  await transaction([
+    { statement: 'DELETE FROM book_folders WHERE gallery_id = ?', values: [Number(id)] },
+    ...folderStatements([id], folderIds),
+  ])
+  bump()
+}
+
+export async function removeBooksFromFolder(ids, folderId) {
+  if (!ids.length) return
   await transaction(
-    folderIds.map((fid) => ({
-      statement: 'INSERT OR IGNORE INTO book_folders(gallery_id, folder_id) VALUES (?,?)',
-      values: [id, Number(fid)],
+    ids.map((id) => ({
+      statement: 'DELETE FROM book_folders WHERE gallery_id = ? AND folder_id = ?',
+      values: [Number(id), Number(folderId)],
     })),
   )
   bump()
 }
 
-export async function removeBookFromFolder(id, folderId) {
-  await run('DELETE FROM book_folders WHERE gallery_id = ? AND folder_id = ?', [id, Number(folderId)])
+/** 批次刪除：單一交易刪資料（book_raw、book_folders 隨 books 串聯刪除），成功後刪封面檔 */
+export async function deleteBooks(ids) {
+  if (!ids.length) return
+  const paths = []
+  for (const id of ids) {
+    const b = await getBook(id)
+    if (b?.cover_path) paths.push(b.cover_path)
+  }
+  await transaction(ids.map((id) => ({ statement: 'DELETE FROM books WHERE gallery_id = ?', values: [Number(id)] })))
+  for (const p of paths) await deleteCoverFile(p)
   bump()
+  await refreshPendingCount()
 }
 
-export async function deleteBook(id) {
+/** ⋮ 選單標題：完整英文／日文標題（單本讀 book_raw，本機解析，不上網） */
+export async function getBookTitles(id) {
   const book = await getBook(id)
-  if (!book) return
-  await run('DELETE FROM books WHERE gallery_id = ?', [id])
-  await deleteCoverFile(book.cover_path)
-  bump()
-}
-
-/** 長按「重新抓封面」 */
-export async function refetchCover(id) {
-  const book = await getBook(id)
-  if (!book) return
-  const meta = await coverMetaFor(book)
-  const tmp = `refetch/${id}-${Date.now()}.tmp`
-  const res = await downloadCover(id, meta, tmp)
-  await replaceCover(id, book.cover_path, res)
-  bump()
+  const out = { pretty: book?.title || '', english: '', japanese: book?.title_ja || '' }
+  const raw = (await query('SELECT raw_json, raw_format FROM book_raw WHERE gallery_id = ?', [Number(id)]))[0]
+  if (raw) {
+    try {
+      const m = parseGallery(JSON.parse(raw.raw_json), raw.raw_format)
+      out.english = m.titleEn
+      out.japanese = m.titleJa || out.japanese
+    } catch {
+      /* 解析失敗就只顯示簡短標題 */
+    }
+  }
+  return out
 }
 
 /**
- * 下載封面所需的 meta（含 coverPath）。book_raw 已是目前格式（api-v2）就本地解析，
- * 否則（api-v1 舊資料、CSV 匯入尚無詳情）重抓詳情並覆寫 book_raw。
+ * 「修改 ID」（找不到這本時用）：以新 ID 重建一筆待補資料，保留資料夾、備註與加入時間，舊的刪除。
+ * 新 ID 已收藏 → DUPLICATE。
  */
-async function coverMetaFor(book) {
-  const raw = (
-    await query('SELECT raw_json, raw_format FROM book_raw WHERE gallery_id = ?', [book.gallery_id])
-  )[0]
-  if (raw?.raw_format === RAW_FORMAT) {
-    try {
-      const m = parseGallery(JSON.parse(raw.raw_json), raw.raw_format)
-      if (m.coverPath) return m
-    } catch {
-      /* 本地資料壞了就重抓 */
-    }
+export async function changeBookId(oldId, newId) {
+  oldId = Number(oldId)
+  newId = checkId(newId)
+  if (newId === oldId) return
+  const old = await getBook(oldId)
+  if (!old) return
+  if (await getBook(newId)) throw new AppError(E.DUPLICATE)
+  try {
+    await transaction([
+      {
+        statement:
+          "INSERT INTO books(gallery_id, title, title_ja, note, fetch_status, added_at, queue_seq) VALUES (?, '', '', ?, 'meta_pending', ?, ?)",
+        values: [newId, old.note ?? null, old.added_at, nextSeq()],
+      },
+      { statement: 'UPDATE book_folders SET gallery_id = ? WHERE gallery_id = ?', values: [newId, oldId] },
+      { statement: 'DELETE FROM books WHERE gallery_id = ?', values: [oldId] },
+    ])
+  } catch (err) {
+    throw dbError(err)
   }
-  return (await fillDetail(book)).meta
+  await deleteCoverFile(old.cover_path)
+  bump()
+  await refreshPendingCount()
+  kick('meta')
 }
 
-async function fillDetail(book) {
-  const d = await fetchDetail(book.gallery_id)
-  await transaction([
-    {
-      statement: 'UPDATE books SET media_id = ?, title = ?, title_ja = ?, cover_ext = ? WHERE gallery_id = ?',
-      values: [d.meta.mediaId, d.meta.title, d.meta.titleJa, d.meta.coverExt, book.gallery_id],
-    },
-    {
-      statement: 'INSERT OR REPLACE INTO book_raw(gallery_id, raw_json, raw_format) VALUES (?,?,?)',
-      values: [book.gallery_id, d.rawJson, d.rawFormat],
-    },
-  ])
-  return d
+/**
+ * ⋮「重抓封面」：重新排進背景佇列（不等網路）。已有 api-v2 原始資料就只抓封面，否則先補資料。
+ * 舊封面保留到新封面下載成功為止。
+ */
+export async function requeueBook(id) {
+  await run(
+    `UPDATE books SET queue_seq = ?, fetch_status = CASE
+        WHEN EXISTS (SELECT 1 FROM book_raw r WHERE r.gallery_id = books.gallery_id AND r.raw_format = ?) THEN 'cover_pending'
+        ELSE 'meta_pending' END
+      WHERE gallery_id = ?`,
+    [nextSeq(), RAW_FORMAT, Number(id)],
+  )
+  bump()
+  await refreshPendingCount()
+  runQueue()
+}
+
+/** 本機的 api-v2 原始資料 → 下載封面所需的 meta；沒有或壞了回傳 null（要先補資料） */
+async function localCoverMeta(id) {
+  const raw = (await query('SELECT raw_json, raw_format FROM book_raw WHERE gallery_id = ?', [id]))[0]
+  if (raw?.raw_format !== RAW_FORMAT) return null
+  try {
+    const m = parseGallery(JSON.parse(raw.raw_json), raw.raw_format)
+    return m.coverPath ? m : null
+  } catch {
+    return null
+  }
 }
 
 export function openUrlFor(id) {
@@ -420,77 +503,232 @@ export async function folderCounts() {
   return { all, uncat, byFolder }
 }
 
-// ================= 待抓佇列（只在前景執行） =================
+// ================= 背景佇列（只在前景執行） =================
+// 兩個工作者各自從資料庫取下一本（依 queue_seq＝加入順序）：
+// - meta：API 隊伍補詳細資料（meta_pending → cover_pending）
+// - cover：圖片隊伍抓封面（cover_pending → ok）
+// 佇列就是 books.fetch_status，存在資料庫，App 重開後自動繼續。
+const NET_RETRY_MS = 30_000
+
 export async function refreshPendingCount() {
-  pendingCount.value = (await query("SELECT COUNT(*) AS n FROM books WHERE fetch_status = 'pending'"))[0].n
+  pendingCount.value = (
+    await query("SELECT COUNT(*) AS n FROM books WHERE fetch_status IN ('meta_pending', 'cover_pending')")
+  )[0].n
 }
 
-let stopRequested = false
+const workers = {
+  meta: { running: false, again: false, timer: null, promise: null },
+  cover: { running: false, again: false, timer: null, promise: null },
+}
+let paused = false
+
+function updateRunning() {
+  queueRunning.value = workers.meta.running || workers.cover.running
+}
+
+/** 啟動某個工作者；正在跑就讓它跑完後再檢查一次（避免剛加入的書被漏掉） */
+function kick(name) {
+  if (paused) return Promise.resolve()
+  const w = workers[name]
+  if (w.running) {
+    w.again = true
+    return w.promise
+  }
+  clearTimeout(w.timer)
+  w.timer = null
+  w.running = true
+  w.again = false
+  updateRunning()
+  w.promise = (name === 'meta' ? metaLoop() : coverLoop())
+    .catch((e) => console.warn(`${name} worker`, e))
+    .finally(async () => {
+      w.running = false
+      updateRunning()
+      await refreshPendingCount().catch(() => {})
+      if (w.again && !paused && !w.timer) kick(name)
+    })
+  return w.promise
+}
+
+function retryLater(name, ms) {
+  const w = workers[name]
+  clearTimeout(w.timer)
+  w.timer = setTimeout(() => {
+    w.timer = null
+    kick(name)
+  }, ms)
+}
+
+/** 回到前景、網路恢復、按「繼續抓取」時呼叫 */
+export function runQueue() {
+  paused = false
+  queueState.error = null
+  return Promise.all([kick('meta'), kick('cover')])
+}
+
+/** 切到背景時呼叫：目前這本做完就停 */
 export function stopQueue() {
-  stopRequested = true
+  paused = true
+  for (const w of Object.values(workers)) {
+    clearTimeout(w.timer)
+    w.timer = null
+  }
 }
 
-/** 依序處理 pending 的書；遇到離線、被擋、限速就停下，回到前景再續跑。 */
-export async function runQueue() {
-  if (queueRunning.value) return
-  queueRunning.value = true
-  stopRequested = false
-  try {
-    while (!stopRequested) {
-      const book = (
-        await query(
-          "SELECT gallery_id, media_id, cover_ext, cover_path FROM books WHERE fetch_status = 'pending' ORDER BY added_at, gallery_id LIMIT 1",
-        )
-      )[0]
-      if (!book) break
-      try {
-        const meta = await coverMetaFor(book)
-        const fresh = await getBook(book.gallery_id)
-        try {
-          const res = await downloadCover(book.gallery_id, meta, `refetch/${book.gallery_id}-${Date.now()}.tmp`)
-          await replaceCover(book.gallery_id, fresh.cover_path, res)
-        } catch (err) {
-          const code = toAppError(err).code
-          // 跟這本書無關的錯誤（限速、寫檔、空間、離線）：停下佇列，不要把整批書標成無封面
-          if ([E.RATE_LIMITED, E.WRITE_FAILED, E.STORAGE_FULL, E.OFFLINE, E.DB_FAILED].includes(code)) throw err
-          await run("UPDATE books SET fetch_status = 'no_cover' WHERE gallery_id = ?", [book.gallery_id])
-        }
-      } catch (err) {
-        const code = toAppError(err).code
-        if ([E.OFFLINE, E.TIMEOUT, E.BLOCKED, E.CHALLENGE, E.RATE_LIMITED, E.STORAGE_FULL, E.WRITE_FAILED, E.DB_FAILED].includes(code)) {
-          throw err
-        }
-        // 查無此書 / 格式不符：不再重試，標為 no_cover（長按可手動重抓）
-        await run("UPDATE books SET fetch_status = 'no_cover' WHERE gallery_id = ?", [book.gallery_id])
+async function nextPending(status) {
+  return (
+    await query(
+      'SELECT gallery_id FROM books WHERE fetch_status = ? ORDER BY queue_seq IS NULL, queue_seq, gallery_id LIMIT 1',
+      [status],
+    )
+  )[0]
+}
+
+async function setStatus(id, status) {
+  await run('UPDATE books SET fetch_status = ? WHERE gallery_id = ?', [status, id])
+}
+
+/** 需要使用者處理的錯誤：停下工作者並顯示 */
+const FATAL = [E.WRITE_FAILED, E.STORAGE_FULL, E.DB_FAILED, E.ENDPOINT_INVALID]
+
+async function metaLoop() {
+  while (!paused) {
+    const row = await nextPending('meta_pending')
+    if (!row) break
+    const id = row.gallery_id
+    let d
+    try {
+      d = await fetchDetail(id)
+    } catch (err) {
+      const e = toAppError(err)
+      if (e.code === E.NOT_FOUND) {
+        await setStatus(id, 'not_found')
+      } else if (e.code === E.BAD_FORMAT) {
+        await setStatus(id, 'meta_failed')
+      } else if (e.code === E.RATE_LIMITED) {
+        const ms = (e.retryAfter || 30) * 1000
+        queueState.apiWaitUntil = Date.now() + ms
+        retryLater('meta', ms)
+        return
+      } else if (e.code === E.CHALLENGE) {
+        queueState.challenge = true // 等使用者按「進行驗證」
+        return
+      } else if (FATAL.includes(e.code)) {
+        queueState.error = e.code
+        return
+      } else {
+        // 離線、逾時、被擋：不算失敗，留在佇列稍後自動重試
+        queueState.netWaitUntil = Date.now() + NET_RETRY_MS
+        retryLater('meta', NET_RETRY_MS)
+        return
       }
-      await refreshPendingCount()
       bump()
+      await refreshPendingCount()
+      continue
     }
-  } finally {
-    queueRunning.value = false
+    queueState.apiWaitUntil = 0
+    queueState.netWaitUntil = 0
+    queueState.challenge = false
+    if (!(await getBook(id))) continue // 查詢途中被刪除或改了 ID
+    try {
+      await transaction([
+        {
+          statement:
+            "UPDATE books SET media_id = ?, title = ?, title_ja = ?, cover_ext = ?, fetch_status = CASE WHEN fetch_status = 'meta_pending' THEN 'cover_pending' ELSE fetch_status END WHERE gallery_id = ?",
+          values: [d.meta.mediaId, d.meta.title, d.meta.titleJa, d.meta.coverExt, id],
+        },
+        {
+          statement: 'INSERT OR REPLACE INTO book_raw(gallery_id, raw_json, raw_format) VALUES (?,?,?)',
+          values: [id, d.rawJson, d.rawFormat],
+        },
+      ])
+    } catch (err) {
+      queueState.error = dbError(err).code
+      return
+    }
+    bump()
+    kick('cover') // 書名有了，封面交給圖片隊伍
+  }
+}
+
+async function coverLoop() {
+  while (!paused) {
+    const row = await nextPending('cover_pending')
+    if (!row) break
+    const id = row.gallery_id
+    const meta = await localCoverMeta(id)
+    if (!meta) {
+      // 沒有可用的原始資料（舊格式或損壞）→ 先補資料
+      await setStatus(id, 'meta_pending')
+      kick('meta')
+      continue
+    }
+    try {
+      const res = await downloadCover(id, meta, `refetch/${id}-${Date.now()}.tmp`)
+      await replaceCover(id, res)
+      queueState.imgWaitUntil = 0
+      queueState.netWaitUntil = 0
+    } catch (err) {
+      const e = toAppError(err)
+      if (e.code === E.RATE_LIMITED) {
+        const ms = (e.retryAfter || 30) * 1000
+        queueState.imgWaitUntil = Date.now() + ms
+        retryLater('cover', ms)
+        return
+      }
+      if (FATAL.includes(e.code)) {
+        queueState.error = e.code
+        return
+      }
+      if (e.code === E.OFFLINE || e.code === E.TIMEOUT) {
+        queueState.netWaitUntil = Date.now() + NET_RETRY_MS
+        retryLater('cover', NET_RETRY_MS)
+        return
+      }
+      await setStatus(id, 'no_cover') // 封面失敗；⋮「重抓封面」可重試
+    }
+    bump()
     await refreshPendingCount()
   }
 }
 
-/** 設定頁「重抓所有缺少的封面」：把沒有封面或封面檔不見的書標成 pending */
+/** 設定頁「重抓所有缺少的封面」：把沒有封面或封面檔不見的書排回佇列 */
 export async function markMissingCoversPending() {
   const { files } = await Filesystem.readdir({ path: COVERS_DIR, directory: Directory.Data }).catch(() => ({
     files: [],
   }))
   const present = new Set(files.map((f) => (typeof f === 'string' ? f : f.name)))
-  const rows = await query('SELECT gallery_id, cover_path, fetch_status FROM books')
+  const rows = await query('SELECT gallery_id, cover_path, fetch_status FROM books ORDER BY added_at, gallery_id')
   const ids = rows
-    .filter((r) => r.fetch_status !== 'pending')
+    .filter((r) => !['meta_pending', 'cover_pending', 'not_found'].includes(r.fetch_status))
     .filter((r) => !r.cover_path || !present.has(r.cover_path.split('/').pop()))
     .map((r) => r.gallery_id)
   if (ids.length) {
     await transaction(
-      ids.map((id) => ({ statement: "UPDATE books SET fetch_status = 'pending' WHERE gallery_id = ?", values: [id] })),
+      ids.map((id) => ({
+        statement: `UPDATE books SET queue_seq = ?, fetch_status = CASE
+            WHEN EXISTS (SELECT 1 FROM book_raw r WHERE r.gallery_id = books.gallery_id AND r.raw_format = ?) THEN 'cover_pending'
+            ELSE 'meta_pending' END
+          WHERE gallery_id = ?`,
+        values: [nextSeq(), RAW_FORMAT, id],
+      })),
     )
   }
   await refreshPendingCount()
   bump()
   return ids.length
+}
+
+// ================= 從瀏覽器分享 =================
+function handleSharedText(text) {
+  if (!text) return
+  sharedInput.value = { id: extractGalleryId(text), at: Date.now() }
+}
+
+/** App 啟動後呼叫一次：處理冷啟動帶進來的分享，並監聽 App 在背景時收到的分享 */
+export async function listenForShares() {
+  await onShareReceived(async () => handleSharedText(await takeSharedText()))
+  handleSharedText(await takeSharedText())
 }
 
 // ================= Cloudflare 驗證 =================
@@ -500,7 +738,12 @@ export async function markMissingCoversPending() {
  * @returns {Promise<boolean>} 是否通過
  */
 export async function verifyChallenge(labels) {
-  return showChallenge(labels)
+  const passed = await showChallenge(labels)
+  if (passed) {
+    queueState.challenge = false
+    runQueue()
+  }
+  return passed
 }
 
 /** 設定頁「重設驗證」：清除 nhentai 的 cookie，auto 模式重新從原生請求試起 */
@@ -635,8 +878,8 @@ export async function commitCsvImport(okRows) {
   for (const r of okRows) {
     set.push({
       statement:
-        "INSERT OR IGNORE INTO books(gallery_id, title, title_ja, note, fetch_status, added_at) VALUES (?, '', '', ?, 'pending', ?)",
-      values: [r.gallery_id, r.note || null, r.added_at],
+        "INSERT OR IGNORE INTO books(gallery_id, title, title_ja, note, fetch_status, added_at, queue_seq) VALUES (?, '', '', ?, 'meta_pending', ?, ?)",
+      values: [r.gallery_id, r.note || null, r.added_at, nextSeq()],
     })
     for (const name of r.folders) {
       set.push({
@@ -649,6 +892,7 @@ export async function commitCsvImport(okRows) {
   await transaction(set)
   await refreshPendingCount()
   bump()
+  runQueue()
 }
 
 export { setSetting, settings }

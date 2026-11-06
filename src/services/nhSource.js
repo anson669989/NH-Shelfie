@@ -24,8 +24,12 @@ const DETAIL_TIMEOUT = 10_000
 const WEBVIEW_TIMEOUT = 20_000 // 不含原生端等待 challenge 自動通過的 15 秒
 const CHALLENGE_URL = 'https://nhentai.net/'
 const COVER_TIMEOUT = 20_000
-// 全局節流：同時只 1 個請求、間隔至少 3 秒（API v2 詳情匿名上限 20 次／分鐘／IP）
+// 節流分兩條獨立隊伍（各自同時只 1 個請求）：
+// - API（詳情、/api/v2/cdn、驗證畫面）：間隔至少 3 秒（v2 詳情匿名上限 20 次／分鐘／IP）
+// - 圖片（t1–t4 封面 CDN）：間隔至少 1 秒。/api/v2/docs 的 cdn 說明沒有明文次數，只說「正常瀏覽很寬鬆、
+//   持續高速會被暫時封鎖、429 一律當退避訊號」，所以採保守的 1 秒。
 const MIN_INTERVAL = 3_000
+const IMG_INTERVAL = 1_000
 const MAX_COVER_BYTES = 5 * 1024 * 1024
 const CDN_CACHE_TTL = 24 * 60 * 60 * 1000
 export const RAW_FORMAT = 'api-v2'
@@ -73,32 +77,49 @@ function log(entry) {
   }
 }
 
-// ---------- 全局節流 ----------
-let chain = Promise.resolve()
-let lastAt = 0
-let blockedUntil = 0
+// ---------- 節流（兩條隊伍） ----------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
-function schedule(fn) {
-  const task = chain.then(async () => {
-    const now = Date.now()
-    if (now < blockedUntil) {
-      throw new AppError(E.RATE_LIMITED, { retryAfter: Math.ceil((blockedUntil - now) / 1000) })
-    }
-    const wait = lastAt + MIN_INTERVAL - now
-    if (wait > 0) await sleep(wait)
-    try {
-      return await fn()
-    } finally {
-      lastAt = Date.now()
-    }
-  })
-  chain = task.catch(() => {})
-  return task
+/**
+ * 建立一條節流隊伍：同時只跑 1 個工作、相鄰工作間隔至少 interval；收到 429 時整條隊伍暫停到 blockedUntil。
+ * 注意：不可在某條隊伍的工作內再呼叫會排進「同一條」隊伍的函式（會互等卡死）。
+ */
+function makeLane(interval) {
+  const lane = { chain: Promise.resolve(), lastAt: 0, blockedUntil: 0, interval }
+  lane.run = (fn) => {
+    const task = lane.chain.then(async () => {
+      const now = Date.now()
+      if (now < lane.blockedUntil) {
+        throw new AppError(E.RATE_LIMITED, { retryAfter: Math.ceil((lane.blockedUntil - now) / 1000) })
+      }
+      const wait = lane.lastAt + lane.interval - now
+      if (wait > 0) await sleep(wait)
+      try {
+        return await fn()
+      } finally {
+        lane.lastAt = Date.now()
+      }
+    })
+    lane.chain = task.catch(() => {})
+    return task
+  }
+  lane.block = (sec) => {
+    lane.blockedUntil = Math.max(lane.blockedUntil, Date.now() + sec * 1000)
+  }
+  return lane
 }
+const apiLane = makeLane(MIN_INTERVAL)
+const imgLane = makeLane(IMG_INTERVAL)
+/** API 隊伍（詳情、cdn、驗證畫面）。所有對 nhentai.net 的請求都經這裡或 imgLane。 */
+const schedule = apiLane.run
 
+/** API 隊伍因 429 還要暫停幾秒 */
 export function rateLimitRemaining() {
-  return Math.max(0, Math.ceil((blockedUntil - Date.now()) / 1000))
+  return Math.max(0, Math.ceil((apiLane.blockedUntil - Date.now()) / 1000))
+}
+/** 圖片隊伍因 429 還要暫停幾秒 */
+export function imageRateLimitRemaining() {
+  return Math.max(0, Math.ceil((imgLane.blockedUntil - Date.now()) / 1000))
 }
 
 // ---------- 網址 ----------
@@ -203,7 +224,7 @@ function interpretDetail({ status, contentType, data, retryAfter }) {
   if (status === 429) {
     const ra = Number.parseInt(retryAfter || '', 10)
     const sec = Number.isFinite(ra) && ra > 0 ? Math.min(ra, 600) : 30
-    blockedUntil = Date.now() + sec * 1000
+    apiLane.block(sec)
     throw new AppError(E.RATE_LIMITED, { httpStatus: status, retryAfter: sec })
   }
   if (isApiRetired({ status, body: typeof data === 'string' ? data : '' })) {
@@ -434,6 +455,16 @@ let cdnInflight = null
 export async function getThumbServers() {
   const cached = readCdnCache()
   if (cached && Date.now() - cached.at < CDN_CACHE_TTL) return cached.servers
+  return refreshThumbServers(cached)
+}
+
+/** 主機全部失敗時呼叫：把快取標成過期，下次下載前重新取得清單（舊清單仍保留當備援）。 */
+function expireCdnCache() {
+  const cached = readCdnCache()
+  if (cached && cached.at) persist('cdn_cache', JSON.stringify({ src: endpoint('endpoint_cdn'), at: 0, servers: cached.servers }))
+}
+
+async function refreshThumbServers(cached) {
   cdnInflight ??= schedule(async () => {
     const url = endpoint('endpoint_cdn')
     const order = settings.fetch_mode === 'webview' || nativeBlocked ? ['webview'] : ['native', 'webview']
@@ -533,8 +564,10 @@ const PASS_THROUGH = [E.RATE_LIMITED, E.WRITE_FAILED, E.STORAGE_FULL, E.OFFLINE]
  * 以原生下載把封面存到快取目錄（不經 base64 橋接），並驗證檔頭與大小。
  * - 網址＝CDN 縮圖伺服器 + meta.coverPath（原樣使用，不猜副檔名）
  * - 下載前先建立目標資料夾
+ * - 經圖片隊伍（imgLane，間隔 ≥ 1 秒），和 API 隊伍互不卡住
  * - 主機順序：上次成功的主機（cdn_last_host）優先，其餘照 /api/v2/cdn 順序（t1→t2→t3→t4）；
- *   主機相關的失敗才換下一台，每次之間至少 MIN_INTERVAL；寫檔失敗／空間不足／系統離線／429 立即停止
+ *   主機相關的失敗才換下一台，每次之間至少 IMG_INTERVAL；寫檔失敗／空間不足／系統離線／429 立即停止；
+ *   每台都失敗時讓 /api/v2/cdn 快取過期，下次重新取得
  * - 每次嘗試寫到各自的暫存檔（cachePath.<n>），逾時後背景仍在寫的檔案不會蓋到下一次
  * @param {{coverPath:string}} meta
  * @param {string} cachePath 例如 preview/123456.tmp（相對於 Directory.Cache）
@@ -569,7 +602,7 @@ export async function downloadCover(galleryId, meta, cachePath, { diagnose = fal
   trace.servers = [...servers]
   const ua = await appUserAgent()
   trace.userAgent = ua
-  return schedule(async () => {
+  return imgLane.run(async () => {
     let lastErr = new AppError(E.COVER_FAILED, { cause: E.UNKNOWN })
     let url = ''
     for (let i = 0; i < servers.length; i++) {
@@ -578,7 +611,7 @@ export async function downloadCover(galleryId, meta, cachePath, { diagnose = fal
       const filePath = `${cachePath}.${i}`
       const startedAt = Date.now()
       try {
-        if (i) await sleep(MIN_INTERVAL)
+        if (i) await sleep(IMG_INTERVAL)
         url = buildCdnUrl(servers[i], meta.coverPath)
         assertAllowed(url)
         step.url = url
@@ -623,17 +656,17 @@ export async function downloadCover(galleryId, meta, cachePath, { diagnose = fal
           lastErr = new AppError(code, { cause: step.message ?? null })
         }
         if (lastErr.code === E.RATE_LIMITED) {
-          blockedUntil = Date.now() + 30_000
           lastErr.retryAfter ??= 30
+          imgLane.block(lastErr.retryAfter)
         }
         step.error = lastErr.code
         await Filesystem.deleteFile({ path: filePath, directory: Directory.Cache }).catch(() => {})
         if (STOP_ROTATION.includes(lastErr.code) || online === false) break
         if (diagnose && step.url) {
-          await sleep(MIN_INTERVAL)
+          await sleep(IMG_INTERVAL)
           step.probe = await probeHead(step.url, ua)
           if (step.probe.status === 429) {
-            blockedUntil = Date.now() + 30_000
+            imgLane.block(30)
             lastErr = new AppError(E.RATE_LIMITED, { httpStatus: 429, retryAfter: 30 })
             break
           }
@@ -642,7 +675,29 @@ export async function downloadCover(galleryId, meta, cachePath, { diagnose = fal
     }
     trace.result = lastErr.code
     log({ gallery_id: galleryId, kind: 'cover', http_status: lastErr.httpStatus ?? null, error_code: lastErr.code })
+    // 每台主機都試過且都是主機相關的失敗 → 清單可能變了，下次重新取得 /api/v2/cdn
+    if (trace.attempts.length === servers.length && !STOP_ROTATION.includes(lastErr.code)) expireCdnCache()
     if (PASS_THROUGH.includes(lastErr.code)) throw Object.assign(lastErr, { url })
     throw new AppError(E.COVER_FAILED, { cause: lastErr.code === E.COVER_FAILED ? lastErr.reason || 'download' : lastErr.code, url })
   })
+}
+
+// ---------- 從瀏覽器「分享」接收文字（nh-webfetch 外掛也負責這件事） ----------
+/** 取出並清除尚未處理的分享文字（冷啟動時由 Intent 帶進來）。非 Android 或沒有時回傳 ''。 */
+export async function takeSharedText() {
+  try {
+    const r = await NhWebFetch.takeSharedText()
+    return typeof r?.text === 'string' ? r.text : ''
+  } catch {
+    return ''
+  }
+}
+
+/** App 已在背景時收到新的分享：外掛發出 shareReceived 事件，callback 內再呼叫 takeSharedText()。 */
+export async function onShareReceived(cb) {
+  try {
+    return await NhWebFetch.addListener('shareReceived', () => cb())
+  } catch {
+    return null
+  }
 }

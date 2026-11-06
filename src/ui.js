@@ -25,6 +25,24 @@ export function closeTopDialog() {
   return true
 }
 
+// 返回鍵處理堆疊（例如多選模式）：對話框之後、切換分頁之前處理
+const backHandlers = []
+/** 註冊返回鍵處理；回傳取消註冊的函式 */
+export function pushBackHandler(fn) {
+  backHandlers.push(fn)
+  return () => {
+    const i = backHandlers.lastIndexOf(fn)
+    if (i >= 0) backHandlers.splice(i, 1)
+  }
+}
+/** 交給最上層的返回鍵處理；回傳是否有處理 */
+export function runBackHandler() {
+  const fn = backHandlers[backHandlers.length - 1]
+  if (!fn) return false
+  fn()
+  return true
+}
+
 /** @returns {Promise<boolean>} */
 export const confirmDialog = (message, { okText, danger = false } = {}) =>
   open('confirm', { message, okText, danger })
@@ -43,10 +61,12 @@ export const promptDialog = (title, { value = '', placeholder = '', maxlength = 
  * 每列可帶：danger（紅字）、checked（列尾勾號）、more（右側「⋯」按鈕，點它 resolve { more: value }）；
  * `{ divider: true }` 為分隔線。
  * @param {{label?:string, value?:any, danger?:boolean, checked?:boolean, more?:boolean, divider?:boolean}[]} actions
- * @param {{tall?:boolean}} [opts] tall：最大高度 70vh、可捲動（長清單用）
+ * @param {{tall?:boolean, lines?:string[]}} [opts] tall：最大高度 70vh、可捲動（長清單用）；
+ *   lines：標題下方的純文字行（例如完整書名），可選取複製
  * @returns {Promise<any|{more:any}|false>}
  */
-export const actionSheet = (title, actions, { tall = false } = {}) => open('sheet', { title, actions, tall })
+export const actionSheet = (title, actions, { tall = false, lines = [] } = {}) =>
+  open('sheet', { title, actions, tall, lines: lines.filter(Boolean) })
 
 /**
  * 多選清單

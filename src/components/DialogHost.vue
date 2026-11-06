@@ -43,6 +43,7 @@
       <!-- 動作選單 -->
       <div v-else-if="d.kind === 'sheet'" class="sheet" :class="{ tall: d.tall }">
         <h3 v-if="d.title" class="sheet-title">{{ d.title }}</h3>
+        <p v-for="(line, i) in d.lines" :key="'l' + i" class="sheet-line">{{ line }}</p>
         <template v-for="(a, i) in d.actions" :key="i">
           <hr v-if="a.divider" class="sheet-divider" />
           <div v-else-if="a.more" class="sheet-row">

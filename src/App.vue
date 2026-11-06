@@ -29,16 +29,16 @@
 </template>
 
 <script setup>
-import { computed, onMounted, onBeforeUnmount, ref } from 'vue'
+import { computed, onMounted, onBeforeUnmount, ref, watch } from 'vue'
 import { App as CapApp } from '@capacitor/app'
 import FoldersPage from './components/FoldersPage.vue'
 import AddPage from './components/AddPage.vue'
 import SettingsPage from './components/SettingsPage.vue'
 import DialogHost from './components/DialogHost.vue'
-import { initLibrary, runQueue, stopQueue, pendingCount } from './services/library.js'
+import { initLibrary, runQueue, stopQueue, listenForShares, sharedInput } from './services/library.js'
 import { settings } from './services/settings.js'
 import { t } from './i18n.js'
-import { closeTopDialog, toast } from './ui.js'
+import { closeTopDialog, runBackHandler, toast } from './ui.js'
 
 const tab = ref('folders')
 const ready = ref(false)
@@ -70,6 +70,7 @@ onMounted(async () => {
   listeners.push(
     await CapApp.addListener('backButton', () => {
       if (closeTopDialog()) return
+      if (runBackHandler()) return // 例如：退出多選模式
       if (tab.value !== 'folders') {
         tab.value = 'folders'
         return
@@ -82,19 +83,27 @@ onMounted(async () => {
       }
     }),
   )
-  // 待抓佇列只在前景執行：切到背景就停，回到前景自動續跑
+  // 背景佇列只在前景執行：切到背景就停，回到前景、網路恢復時自動續跑；App 重開後也會從資料庫接著做
   listeners.push(
     await CapApp.addListener('appStateChange', ({ isActive }) => {
-      if (isActive) {
-        if (pendingCount.value > 0) runQueue().catch(() => {})
-      } else stopQueue()
+      if (isActive) runQueue().catch(() => {})
+      else stopQueue()
     }),
   )
-  if (pendingCount.value > 0) runQueue().catch(() => {})
+  window.addEventListener('online', onOnline)
+  runQueue().catch(() => {})
+  // 從瀏覽器「分享」進來：切到「新增」頁（AddPage 會填入 ID）
+  listenForShares().catch((e) => console.warn('share listener', e))
+})
+
+const onOnline = () => runQueue().catch(() => {})
+watch(sharedInput, (v) => {
+  if (v) tab.value = 'add'
 })
 
 onBeforeUnmount(() => {
   mq?.removeEventListener?.('change', onMq)
+  window.removeEventListener('online', onOnline)
   listeners.forEach((l) => l.remove())
 })
 </script>

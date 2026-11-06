@@ -54,7 +54,22 @@ const MIGRATIONS = [
     error_code  TEXT
   );
   `,
-  // v2（路線 B，M5 時啟用）：tags / book_tags —— 目前尚未加入，標籤可由 book_raw 本地解析補建。
+  // v2（任務 006「先存、後查」）：背景佇列的排隊順序 queue_seq（加入時的毫秒時間）。
+  // fetch_status 新值：meta_pending（待補資料）→ cover_pending（有書名、待抓封面）→ ok；
+  // 失敗：not_found（站上找不到）、meta_failed（資料讀不懂）、no_cover（封面失敗）。
+  // 舊的 pending：已有 api-v2 原始資料就只差封面，否則先補資料。
+  `
+  ALTER TABLE books ADD COLUMN queue_seq INTEGER;
+  UPDATE books SET queue_seq = added_at * 1000 WHERE fetch_status = 'pending';
+  UPDATE books SET fetch_status = CASE
+      WHEN EXISTS (SELECT 1 FROM book_raw r WHERE r.gallery_id = books.gallery_id AND r.raw_format = 'api-v2')
+        THEN 'cover_pending'
+      ELSE 'meta_pending'
+    END
+    WHERE fetch_status = 'pending';
+  CREATE INDEX IF NOT EXISTS idx_books_queue ON books(fetch_status, queue_seq);
+  `,
+  // v3（路線 B，M5 時啟用）：tags / book_tags —— 目前尚未加入，標籤可由 book_raw 本地解析補建。
 ]
 
 export async function initDb() {

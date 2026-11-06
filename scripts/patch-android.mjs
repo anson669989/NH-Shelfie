@@ -5,6 +5,7 @@
 // 2. network security config：全域禁止明文傳輸
 // 3. app/build.gradle：由環境變數注入 versionCode / versionName 與 release 簽章
 // 4. App 圖示：以 scripts/gen-icons.mjs 產生（取代 Capacitor 預設圖示）
+// 5. 從瀏覽器「分享」加入：MainActivity 接收 ACTION_SEND text/plain（由 nh-webfetch 外掛讀取）
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { generateIcons } from './gen-icons.mjs'
@@ -33,8 +34,30 @@ if (!manifest.includes('android:networkSecurityConfig')) {
 if (!manifest.includes('android:fullBackupContent')) {
   manifest = manifest.replace('<application', '<application\n        android:fullBackupContent="false"')
 }
+// ---------- 5. 分享 intent-filter（加到 MainActivity；launchMode singleTask 讓背景時走 onNewIntent）----------
+const SHARE_FILTER = `
+            <!-- nh-shelfie share: 從瀏覽器「分享」網址加入 -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+`
+const MAIN_ACTIVITY_RE = /<activity\b[^>]*android:name="(?:\.|[\w.]+\.)MainActivity"/
+if (!manifest.includes('android.intent.action.SEND')) {
+  const actStart = manifest.search(MAIN_ACTIVITY_RE)
+  if (actStart < 0) {
+    console.error('找不到 MainActivity，無法加入分享 intent-filter')
+    process.exit(1)
+  }
+  const actEnd = manifest.indexOf('</activity>', actStart)
+  manifest = manifest.slice(0, actEnd).trimEnd() + SHARE_FILTER + '        ' + manifest.slice(actEnd)
+}
+if (!/android:launchMode="singleTask"/.test(manifest)) {
+  manifest = manifest.replace(MAIN_ACTIVITY_RE, (m) => `${m}\n            android:launchMode="singleTask"`)
+}
 writeFileSync(manifestPath, manifest)
-console.log('✔ AndroidManifest.xml 已更新')
+console.log('✔ AndroidManifest.xml 已更新（含分享 intent-filter）')
 
 const xmlDir = join(appDir, 'src', 'main', 'res', 'xml')
 mkdirSync(xmlDir, { recursive: true })
