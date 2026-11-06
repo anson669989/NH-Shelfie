@@ -4,8 +4,10 @@
 // 1. 關閉 allowBackup（換機改用 CSV）
 // 2. network security config：全域禁止明文傳輸
 // 3. app/build.gradle：由環境變數注入 versionCode / versionName 與 release 簽章
+// 4. App 圖示：以 scripts/gen-icons.mjs 產生（取代 Capacitor 預設圖示）
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
+import { generateIcons } from './gen-icons.mjs'
 
 const root = process.cwd()
 const appDir = join(root, 'android', 'app')
@@ -94,3 +96,7 @@ if (ksPath) {
 } else {
   console.log('• app/build.gradle 已有 CI 設定，略過')
 }
+
+// ---------- 4. App 圖示 ----------
+const resDir = join(appDir, 'src', 'main', 'res')
+console.log('✔ App 圖示已產生：', generateIcons(resDir).join(', '))

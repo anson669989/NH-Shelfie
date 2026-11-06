@@ -50,7 +50,12 @@
             <div v-if="result.meta.titleJa && result.meta.titleJa !== result.meta.title" class="muted small">
               {{ result.meta.titleJa }}
             </div>
-            <p v-if="!result.cover" class="muted small">{{ t('add.noCoverNote') }}</p>
+            <template v-if="!result.cover">
+              <p v-if="result.coverError" class="notice warn small">
+                {{ t('add.coverFailed', { reason: errText(new AppError(result.coverError)) }) }}
+              </p>
+              <p class="muted small">{{ t('add.noCoverNote') }}</p>
+            </template>
           </div>
         </div>
         <div v-else-if="error" class="notice error">

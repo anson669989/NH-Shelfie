@@ -82,7 +82,11 @@
         </div>
         <div class="row">
           <button class="btn text" @click="calcSize">{{ sizeText || t('settings.calcSize') }}</button>
-          <button class="btn text" @click="clearCache">{{ t('settings.clearCache') }}</button>
+        </div>
+        <!-- 封面快取：只清暫存資料夾（preview/、refetch/、test/、export/），收藏的封面不刪 -->
+        <div class="row col">
+          <span v-if="tempText" class="muted small">{{ tempText }}</span>
+          <button class="btn text" :disabled="clearing" @click="clearCache">{{ t('settings.clearCache') }}</button>
         </div>
       </div>
 
@@ -166,6 +170,7 @@ import {
   runQueue,
   markMissingCoversPending,
   coversSize,
+  tempCacheSize,
   clearTempCache,
   testConnection,
   fetchLogSummary,
@@ -185,6 +190,8 @@ const fileInput = ref(null)
 const busy = ref(false)
 const testing = ref(false)
 const sizeText = ref('')
+const tempText = ref('')
+const clearing = ref(false)
 const logText = ref('')
 const version = ref('')
 const ep = reactive({ ...DEFAULT_ENDPOINTS })
@@ -206,6 +213,7 @@ watch(
     if (!active) return
     for (const k of Object.keys(DEFAULT_ENDPOINTS)) ep[k] = settings[k]
     refreshLog()
+    refreshTempSize()
     if (!version.value) {
       try {
         const info = await CapApp.getInfo()
@@ -285,9 +293,27 @@ async function calcSize() {
   sizeText.value = t('settings.coversSize', { count: s.count, size: formatBytes(s.bytes) })
 }
 
+async function refreshTempSize() {
+  try {
+    const s = await tempCacheSize()
+    tempText.value = t('settings.tempSize', { count: s.count, size: formatBytes(s.bytes) })
+  } catch {
+    tempText.value = ''
+  }
+}
+
 async function clearCache() {
-  await clearTempCache()
-  toast(t('settings.cleared'))
+  if (clearing.value) return
+  clearing.value = true
+  try {
+    await clearTempCache()
+    toast(t('settings.cleared'))
+  } catch (err) {
+    toast(errText(toAppError(err)))
+  } finally {
+    clearing.value = false
+    await refreshTempSize()
+  }
 }
 
 async function doTest() {
