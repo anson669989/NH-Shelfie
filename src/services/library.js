@@ -314,7 +314,7 @@ export async function deleteFolder(id) {
   bump()
 }
 
-/** dir = -1 往前、+1 往後 */
+/** dir = -1 往上、+1 往下 */
 export async function moveFolder(id, dir) {
   const list = await listFolders()
   const i = list.findIndex((f) => f.id === Number(id))
@@ -341,14 +341,19 @@ export async function setSortMode(folderKey, mode) {
   else await run('UPDATE folders SET sort_mode = ? WHERE id = ?', [mode, Number(folderKey)])
 }
 
-export async function counts() {
+/** 各資料夾本數：{ all, uncat, byFolder: { [folderId]: n } } */
+export async function folderCounts() {
   const all = (await query('SELECT COUNT(*) AS n FROM books'))[0].n
   const uncat = (
     await query(
       'SELECT COUNT(*) AS n FROM books b WHERE NOT EXISTS (SELECT 1 FROM book_folders bf WHERE bf.gallery_id = b.gallery_id)',
     )
   )[0].n
-  return { all, uncat }
+  const byFolder = {}
+  for (const r of await query('SELECT folder_id, COUNT(*) AS n FROM book_folders GROUP BY folder_id')) {
+    byFolder[r.folder_id] = r.n
+  }
+  return { all, uncat, byFolder }
 }
 
 // ================= 待抓佇列（只在前景執行） =================

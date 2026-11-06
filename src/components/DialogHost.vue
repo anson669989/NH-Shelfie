@@ -35,17 +35,22 @@
       </form>
 
       <!-- 動作選單 -->
-      <div v-else-if="d.kind === 'sheet'" class="sheet">
+      <div v-else-if="d.kind === 'sheet'" class="sheet" :class="{ tall: d.tall }">
         <h3 v-if="d.title" class="sheet-title">{{ d.title }}</h3>
-        <button
-          v-for="(a, i) in d.actions"
-          :key="i"
-          class="sheet-item"
-          :class="{ danger: a.danger }"
-          @click="closeDialog(d, a.value)"
-        >
-          {{ a.label }}
-        </button>
+        <template v-for="(a, i) in d.actions" :key="i">
+          <hr v-if="a.divider" class="sheet-divider" />
+          <div v-else-if="a.more" class="sheet-row">
+            <button class="sheet-item" :class="{ danger: a.danger }" @click="closeDialog(d, a.value)">
+              <span class="sheet-label">{{ a.label }}</span>
+              <span v-if="a.checked" class="sheet-check">✓</span>
+            </button>
+            <button class="sheet-more" :aria-label="t('folder.more')" @click="closeDialog(d, { more: a.value })">⋯</button>
+          </div>
+          <button v-else class="sheet-item" :class="{ danger: a.danger }" @click="closeDialog(d, a.value)">
+            <span class="sheet-label">{{ a.label }}</span>
+            <span v-if="a.checked" class="sheet-check">✓</span>
+          </button>
+        </template>
         <button class="sheet-item cancel" @click="closeDialog(d, false)">{{ t('common.cancel') }}</button>
       </div>
 

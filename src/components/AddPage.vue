@@ -1,43 +1,49 @@
 <template>
   <section class="page add-page">
-    <div class="add-inner">
-      <!-- 1. ID 輸入框 -->
-      <form class="id-row" @submit.prevent="lookup">
-        <input
-          ref="inputEl"
-          v-model="raw"
-          class="input id-input"
-          type="text"
-          inputmode="numeric"
-          enterkeyhint="search"
-          autocomplete="off"
-          :placeholder="t('add.placeholder')"
-          @input="onInput"
-          @paste="onPaste"
-        />
-        <button type="submit" class="btn primary" :disabled="!parsedId || loading || !!dup">
-          {{ t('add.query') }}
-        </button>
-      </form>
-      <p v-if="raw && !parsedId" class="field-error">{{ t('err.INVALID_ID') }}</p>
-      <p v-else-if="!raw" class="muted small">{{ t('add.hint') }}</p>
-
-      <!-- 3. 重複提示（不發網路請求） -->
-      <div v-if="dup" class="notice warn">
-        <strong>{{ t('add.duplicate', { id: dup.book.gallery_id }) }}</strong>
-        <span v-if="dup.book.title"> · {{ dup.book.title }}</span>
-        <div>{{ t('add.inFolders', { names: dup.folders.length ? dup.folders.map((f) => f.name).join('、') : t('folder.uncat') }) }}</div>
+    <!-- 1. 頂部固定：ID 輸入框 -->
+    <div class="add-top">
+      <div class="add-inner">
+        <form class="id-row" @submit.prevent="lookup">
+          <input
+            ref="inputEl"
+            v-model="raw"
+            class="input id-input"
+            type="text"
+            inputmode="numeric"
+            enterkeyhint="search"
+            autocomplete="off"
+            :placeholder="t('add.placeholder')"
+            @input="onInput"
+            @paste="onPaste"
+            @focus="focused = true"
+            @blur="focused = false"
+          />
+          <button type="submit" class="btn primary" :disabled="!parsedId || loading || !!dup">
+            {{ t('add.query') }}
+          </button>
+        </form>
+        <p v-if="raw && !parsedId" class="field-error">{{ t('err.INVALID_ID') }}</p>
       </div>
+    </div>
 
-      <!-- 2. 封面預覽＋書名 -->
-      <div class="preview">
+    <!-- 中間可捲動：重複提示＋封面預覽 -->
+    <div class="add-body">
+      <div class="add-inner">
+        <!-- 重複提示（不發網路請求） -->
+        <div v-if="dup" class="notice warn">
+          <strong>{{ t('add.duplicate', { id: dup.book.gallery_id }) }}</strong>
+          <span v-if="dup.book.title"> · {{ dup.book.title }}</span>
+          <div>{{ t('add.inFolders', { names: dup.folders.length ? dup.folders.map((f) => f.name).join('、') : t('folder.uncat') }) }}</div>
+        </div>
+
+        <!-- 封面預覽＋書名 -->
         <div v-if="loading" class="preview-card skeleton">
           <div class="sk-cover" />
           <div class="sk-lines"><div /><div /><div /></div>
         </div>
         <div v-else-if="result" class="preview-card">
           <img v-if="result.cover" :src="result.cover.src" alt="" />
-          <div v-else class="cover-placeholder small"><span>?</span></div>
+          <div v-else class="cover-placeholder preview-ph"><span>?</span></div>
           <div class="preview-info">
             <div class="muted">#{{ result.id }}</div>
             <div class="preview-title">{{ result.meta.title || result.meta.titleJa }}</div>
@@ -58,24 +64,27 @@
             {{ cooldown > 0 ? `${t('common.retry')} (${cooldown})` : t('common.retry') }}
           </button>
         </div>
+        <p v-else-if="!dup" class="add-empty muted">{{ t('add.hint') }}</p>
       </div>
+    </div>
 
-      <!-- 4. 資料夾多選＋「＋」 -->
-      <div class="folder-pick">
-        <label class="muted small">{{ t('add.folders') }}</label>
-        <div class="folder-pick-row">
-          <button class="select-like" @click="pickFolders">
-            {{ selectedNames || t('add.noFolder') }}
-            <span class="caret">▾</span>
-          </button>
-          <button class="btn icon" :aria-label="t('folder.new')" @click="quickNewFolder">＋</button>
+    <!-- 底部固定：資料夾多選＋加入收藏（鍵盤開啟時隱藏，避免擠掉預覽區） -->
+    <div v-show="!focused" class="add-actions">
+      <div class="add-inner">
+        <div class="folder-pick">
+          <label class="muted small">{{ t('add.folders') }}</label>
+          <div class="folder-pick-row">
+            <button class="select-like" @click="pickFolders">
+              <span class="folder-select-name">{{ selectedNames || t('add.noFolder') }}</span>
+              <span class="caret">▾</span>
+            </button>
+            <button class="btn icon" :aria-label="t('folder.new')" @click="quickNewFolder">＋</button>
+          </div>
         </div>
+        <button class="btn primary block big" :disabled="!canSubmit" @click="submit">
+          {{ saving ? t('add.saving') : dup ? t('add.addToMore') : t('add.submit') }}
+        </button>
       </div>
-
-      <!-- 5. 加入收藏 -->
-      <button class="btn primary block big" :disabled="!canSubmit" @click="submit">
-        {{ saving ? t('add.saving') : dup ? t('add.addToMore') : t('add.submit') }}
-      </button>
     </div>
   </section>
 </template>
@@ -103,6 +112,7 @@ const props = defineProps({ active: Boolean })
 
 const inputEl = ref(null)
 const raw = ref('')
+const focused = ref(false) // ID 輸入框聚焦中（鍵盤開啟）
 const loading = ref(false)
 const saving = ref(false)
 const result = ref(null)

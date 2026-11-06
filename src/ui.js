@@ -37,10 +37,13 @@ export const promptDialog = (title, { value = '', placeholder = '', maxlength = 
 
 /**
  * 動作選單
- * @param {{label:string, value:any, danger?:boolean}[]} actions
- * @returns {Promise<any|false>}
+ * 每列可帶：danger（紅字）、checked（列尾勾號）、more（右側「⋯」按鈕，點它 resolve { more: value }）；
+ * `{ divider: true }` 為分隔線。
+ * @param {{label?:string, value?:any, danger?:boolean, checked?:boolean, more?:boolean, divider?:boolean}[]} actions
+ * @param {{tall?:boolean}} [opts] tall：最大高度 70vh、可捲動（長清單用）
+ * @returns {Promise<any|{more:any}|false>}
  */
-export const actionSheet = (title, actions) => open('sheet', { title, actions })
+export const actionSheet = (title, actions, { tall = false } = {}) => open('sheet', { title, actions, tall })
 
 /**
  * 多選清單
