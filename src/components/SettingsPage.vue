@@ -96,9 +96,31 @@
               {{ testing ? t('settings.testing') : t('settings.testConnection') }}
             </button>
           </div>
+        </div>
+        <!-- 以下僅開發者模式（關於 → 版本 連點 7 次）顯示 -->
+        <div v-if="devMode" class="row col">
           <span class="muted small">{{ logText }}</span>
         </div>
-        <details class="row col">
+        <div v-if="devMode" class="row col">
+          <span>{{ t('settings.fetchMode') }}</span>
+          <div class="segmented">
+            <button
+              v-for="m in ['auto', 'native', 'webview']"
+              :key="m"
+              :class="{ on: settings.fetch_mode === m }"
+              @click="setSetting('fetch_mode', m)"
+            >
+              {{ t('settings.fetchMode.' + m) }}
+            </button>
+          </div>
+          <span class="muted small">{{ t('settings.lastFetchVia', { via: settings.last_fetch_ok || '—' }) }}</span>
+        </div>
+        <div v-if="devMode" class="row">
+          <button class="btn text" :disabled="testing" @click="doResetVerification">
+            {{ t('settings.resetVerification') }}
+          </button>
+        </div>
+        <details v-if="devMode" class="row col">
           <summary>{{ t('settings.endpoints') }}</summary>
           <p class="notice warn small">{{ t('settings.endpointWarning') }}</p>
           <label class="small">{{ t('settings.endpointDetail') }}</label>
@@ -122,7 +144,7 @@
             {{ t('settings.help') }}
           </button>
         </div>
-        <div class="row">
+        <div class="row version-row" @click="onVersionTap">
           <span>{{ t('settings.version') }}</span>
           <span class="muted">{{ version }}</span>
         </div>
@@ -147,6 +169,8 @@ import {
   clearTempCache,
   testConnection,
   fetchLogSummary,
+  verifyChallenge,
+  resetVerification,
 } from '../services/library.js'
 import { validateEndpointTemplate } from '../services/parse.js'
 import { AppError, E, toAppError } from '../services/errors.js'
@@ -164,6 +188,7 @@ const sizeText = ref('')
 const logText = ref('')
 const version = ref('')
 const ep = reactive({ ...DEFAULT_ENDPOINTS })
+const devMode = computed(() => settings.dev_mode === '1')
 
 const lastExportText = computed(() => {
   const s = Number(settings.last_export_at)
@@ -268,15 +293,51 @@ async function clearCache() {
 async function doTest() {
   testing.value = true
   try {
-    const r = await testConnection()
+    let r = await testConnection()
+    if (r.detail === E.CHALLENGE) {
+      // 需要手動通過 Cloudflare 驗證：通過後自動重測一次
+      const go = await confirmDialog(errText(new AppError(E.CHALLENGE)), { okText: t('challenge.verify') })
+      if (!go) return
+      const passed = await verifyChallenge({ title: t('challenge.title'), closeLabel: t('common.close') })
+      if (!passed) {
+        toast(t('challenge.notPassed'))
+        return
+      }
+      r = await testConnection()
+    }
     const fmt = (v) => (v === 'ok' ? '✓ OK' : `✗ ${errText(new AppError(v))}`)
     await alertDialog(t('settings.testResult', { detail: fmt(r.detail), cover: r.detail === 'ok' ? fmt(r.cover) : '—' }), {
       title: t('settings.testConnection'),
     })
+  } catch (err) {
+    toast(errText(toAppError(err)))
   } finally {
     testing.value = false
     refreshLog()
   }
+}
+
+async function doResetVerification() {
+  try {
+    await resetVerification()
+    toast(t('settings.verificationReset'))
+  } catch (err) {
+    toast(errText(toAppError(err)))
+  }
+}
+
+// 關於 → 版本：1.5 秒內連點 7 次切換開發者模式
+let tapCount = 0
+let lastTapAt = 0
+async function onVersionTap() {
+  const now = Date.now()
+  tapCount = now - lastTapAt < 1500 ? tapCount + 1 : 1
+  lastTapAt = now
+  if (tapCount < 7) return
+  tapCount = 0
+  const on = !devMode.value
+  await setSetting('dev_mode', on ? '1' : '0')
+  toast(t(on ? 'settings.devModeOn' : 'settings.devModeOff'))
 }
 
 async function saveEndpoints() {

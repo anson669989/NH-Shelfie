@@ -55,8 +55,11 @@
         </div>
         <div v-else-if="error" class="notice error">
           <span>{{ errText(error) }}</span>
+          <button v-if="error.code === 'CHALLENGE'" class="btn text" :disabled="verifying" @click="verifyAndRetry">
+            {{ t('challenge.verify') }}
+          </button>
           <button
-            v-if="['OFFLINE', 'TIMEOUT', 'BLOCKED', 'RATE_LIMITED'].includes(error.code)"
+            v-else-if="['OFFLINE', 'TIMEOUT', 'BLOCKED', 'RATE_LIMITED'].includes(error.code)"
             class="btn text"
             :disabled="cooldown > 0"
             @click="lookup"
@@ -100,6 +103,7 @@ import {
   listFolders,
   createFolder,
   dataVersion,
+  verifyChallenge,
 } from '../services/library.js'
 import { parseGalleryId } from '../services/parse.js'
 import { AppError, E, toAppError } from '../services/errors.js'
@@ -121,6 +125,7 @@ const dup = ref(null)
 const folders = ref([])
 const selected = ref([])
 const cooldown = ref(0)
+const verifying = ref(false)
 let cooldownTimer = null
 let lookupSeq = 0
 
@@ -214,6 +219,21 @@ async function lookup() {
     }
   } finally {
     if (seq === lookupSeq) loading.value = false
+  }
+}
+
+/** Cloudflare 驗證：顯示驗證畫面，通過後自動重試一次查詢 */
+async function verifyAndRetry() {
+  if (verifying.value) return
+  verifying.value = true
+  try {
+    const passed = await verifyChallenge({ title: t('challenge.title'), closeLabel: t('common.close') })
+    if (passed) await lookup()
+    else toast(t('challenge.notPassed'))
+  } catch (err) {
+    toast(errText(toAppError(err)))
+  } finally {
+    verifying.value = false
   }
 }
 
