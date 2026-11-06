@@ -35,9 +35,11 @@ Capacitor + Vue 3 的 Android App：輸入 gallery ID，抓封面存本機，以
 
 ## 已知限制與待辦
 
+- **進行中：`docs/tasks/001-cloudflare-webview.md`**——v0.1.0 實機測試詳情 API 全部被 Cloudflare 擋下（BLOCKED×5），要實作 WebView 驗證抓取。開始工作前先讀這份任務檔。
+- **進行中：`docs/tasks/002-folder-dropdown.md`**——資料夾頁的橫向標籤列改成下拉選單（含資料夾管理）。與 001 一起在 v0.1.1 發佈。
 - 已做：M1 路線 A MVP、M2 設定頁、M3 CSV
 - 未做：M4 詳情頁（標籤＋備註）、M5 標籤搜尋（tags / book_tags 以 `MIGRATIONS` 新增 v2，從 book_raw 本地解析）
-- 未做：Cloudflare 備援 2、3（WebView 過驗證、手動指定封面）、FLAG_SECURE、App 開啟鎖
+- 未做：Cloudflare 備援 3（手動指定封面）、FLAG_SECURE、App 開啟鎖
 - 沒有桌面預覽：SQLite / Filesystem 外掛只在 Android 運作，`npm run dev` 只能看靜態樣式
 
 ## 改完後的檢查清單
