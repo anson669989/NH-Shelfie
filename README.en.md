@@ -18,7 +18,6 @@
   <a href="https://github.com/anson669989/NH-Shelfie/releases/latest">⬇️ Download the latest APK</a>
 </h3>
 
-> ⚠️ This app involves adult content and is intended for users 18 and over only.
 
 ## ✨ Features
 
