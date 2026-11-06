@@ -1,0 +1,19 @@
+{
+  "appId": "io.github.anson669989.nhshelfie",
+  "appName": "NH Shelfie",
+  "webDir": "dist",
+  "android": {
+    "allowMixedContent": false,
+    "captureInput": false,
+    "webContentsDebuggingEnabled": false,
+    "adjustMarginsForEdgeToEdge": "auto"
+  },
+  "plugins": {
+    "CapacitorHttp": {
+      "enabled": false
+    },
+    "CapacitorSQLite": {
+      "androidIsEncryption": false
+    }
+  }
+}

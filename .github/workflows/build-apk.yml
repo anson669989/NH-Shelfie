@@ -1,0 +1,113 @@
+name: Build Android APK
+
+# - push 到 main / PR：跑測試並建置 debug APK（放在 Actions 的 Artifacts，可下載測試）
+# - push 標籤 v*（例如 v0.1.0）：建置「已簽章」的 release APK 並發佈到 GitHub Releases
+# - 也可在 Actions 頁面手動執行（workflow_dispatch）
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      IS_TAG: ${{ startsWith(github.ref, 'refs/tags/v') }}
+      HAS_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Install dependencies
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Build web
+        run: npm run build
+
+      - name: Create & patch Android project
+        run: |
+          if [ ! -d android ]; then npx cap add android; fi
+          node scripts/patch-android.mjs
+          npx cap sync android
+
+      - name: Compute version
+        id: ver
+        run: |
+          if [ "$IS_TAG" = "true" ]; then
+            VERSION_NAME="${GITHUB_REF_NAME#v}"
+          else
+            VERSION_NAME="$(node -p "require('./package.json').version")-dev.${GITHUB_RUN_NUMBER}"
+          fi
+          echo "VERSION_NAME=$VERSION_NAME" >> "$GITHUB_ENV"
+          echo "VERSION_CODE=${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
+          echo "name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Require keystore for releases
+        if: env.IS_TAG == 'true' && env.HAS_KEYSTORE != 'true'
+        run: |
+          echo "::error::發佈 release 需要簽章金鑰。請依 README『設定簽章金鑰』在 Settings → Secrets 加入 ANDROID_KEYSTORE_BASE64 等四個 secrets。"
+          exit 1
+
+      - name: Decode keystore
+        if: env.HAS_KEYSTORE == 'true'
+        run: |
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > "$RUNNER_TEMP/release.jks"
+          echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+
+      - name: Gradle build
+        working-directory: android
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          chmod +x gradlew
+          mkdir -p ../out
+          if [ "$HAS_KEYSTORE" = "true" ]; then
+            ./gradlew --no-daemon assembleRelease
+            cp app/build/outputs/apk/release/app-release.apk ../out/nh-shelfie.apk
+          else
+            ./gradlew --no-daemon assembleDebug
+            cp app/build/outputs/apk/debug/app-debug.apk ../out/nh-shelfie-debug.apk
+          fi
+          ls -la ../out
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nh-shelfie-${{ steps.ver.outputs.name }}
+          path: out/*.apk
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: env.IS_TAG == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          name: NH Shelfie ${{ github.ref_name }}
+          files: out/nh-shelfie.apk
+          generate_release_notes: true
+          fail_on_unmatched_files: true
