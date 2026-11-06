@@ -117,6 +117,22 @@ export function sniffImageExt(input) {
   return null
 }
 
+// Cloudflare challenge／攔截頁的特徵字串。原生外掛 NhWebFetchPlugin.java 的 CHALLENGE_MARKERS 要同步。
+const CHALLENGE_MARKERS = /Just a moment\.\.\.|cf-chl|cf_chl_opt|challenge-platform|Attention Required! \| Cloudflare/i
+
+/**
+ * 判斷一個 HTTP 回應是否為 Cloudflare challenge／攔截頁（而非 API 資料）。
+ * - 內文含 challenge 特徵字串 → true
+ * - 403 / 503 且是 HTML → true（Cloudflare 擋下時的典型回應）
+ * @param {{status?:number, contentType?:string, body?:string}} res
+ */
+export function isChallengePage({ status, contentType, body } = {}) {
+  const text = typeof body === 'string' ? body.slice(0, 32_768) : ''
+  if (CHALLENGE_MARKERS.test(text)) return true
+  const isHtml = /text\/html/i.test(String(contentType || '')) || /^\s*<(!doctype|html)/i.test(text)
+  return (status === 403 || status === 503) && isHtml
+}
+
 /** 資料夾名稱：去頭尾空白、1–30 字。回傳整理後名稱或 null。 */
 export function normalizeFolderName(name) {
   const s = String(name ?? '').replace(/\s+/g, ' ').trim()

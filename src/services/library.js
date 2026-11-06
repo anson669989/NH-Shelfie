@@ -8,7 +8,15 @@ import { AppError, E, toAppError } from './errors.js'
 import { normalizeFolderName } from './parse.js'
 import { buildCsv, validateCsv, CSV_MAX_BYTES } from './csv.js'
 import { loadSettings, setSetting, settings } from './settings.js'
-import { fetchDetail, downloadCover, setFetchLogger, galleryPageUrl } from './nhSource.js'
+import {
+  fetchDetail,
+  downloadCover,
+  setFetchLogger,
+  setModeRecorder,
+  galleryPageUrl,
+  showChallenge,
+  clearSession,
+} from './nhSource.js'
 
 const COVERS_DIR = 'covers'
 const PREVIEW_DIR = 'preview'
@@ -28,6 +36,7 @@ export async function initLibrary() {
   await initDb()
   await loadSettings()
   setFetchLogger(writeFetchLog)
+  setModeRecorder((mode) => setSetting('last_fetch_ok', mode))
 
   await Filesystem.mkdir({ path: COVERS_DIR, directory: Directory.Data, recursive: true }).catch(() => {})
   await Filesystem.writeFile({
@@ -401,7 +410,7 @@ export async function runQueue() {
         }
       } catch (err) {
         const code = toAppError(err).code
-        if ([E.OFFLINE, E.TIMEOUT, E.BLOCKED, E.RATE_LIMITED, E.STORAGE_FULL].includes(code)) {
+        if ([E.OFFLINE, E.TIMEOUT, E.BLOCKED, E.CHALLENGE, E.RATE_LIMITED, E.STORAGE_FULL].includes(code)) {
           throw err
         }
         // 查無此書 / 格式不符：不再重試，標為 no_cover（長按可手動重抓）
@@ -435,6 +444,22 @@ export async function markMissingCoversPending() {
   await refreshPendingCount()
   bump()
   return ids.length
+}
+
+// ================= Cloudflare 驗證 =================
+/**
+ * 顯示驗證畫面讓使用者手動通過 Cloudflare challenge。
+ * @param {{title:string, closeLabel:string}} labels 由介面以 t() 提供
+ * @returns {Promise<boolean>} 是否通過
+ */
+export async function verifyChallenge(labels) {
+  return showChallenge(labels)
+}
+
+/** 設定頁「重設驗證」：清除 nhentai 的 cookie，auto 模式重新從原生請求試起 */
+export async function resetVerification() {
+  await clearSession()
+  await setSetting('last_fetch_ok', '')
 }
 
 // ================= 健康檢查 =================

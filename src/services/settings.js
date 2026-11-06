@@ -18,6 +18,9 @@ export const DEFAULTS = Object.freeze({
   last_folders: '[]',
   last_export_at: '',
   test_id: '177013',
+  fetch_mode: 'auto', // auto | native | webview
+  last_fetch_ok: '', // auto 模式記住上次成功的方式：native | webview
+  dev_mode: '0', // 1 = 顯示開發者選項（關於 → 版本 連點 7 次切換）
   ...DEFAULT_ENDPOINTS,
 })
 
