@@ -80,7 +80,7 @@ All data lives only on your phone. The app collects and uploads nothing, has no 
 
 ## ⚖️ Disclaimer
 
-This is an unofficial personal project and is not affiliated with nhentai in any way. For adults only — please follow the laws where you live.
+This is an unofficial personal project and is not affiliated with nhentai in any way. Please follow the laws where you live.
 
 ---
 
