@@ -1,19 +1,33 @@
 // 轉接層：所有對 nhentai 的請求與解析都集中在這裡，對內只輸出固定的 BookMeta。
 // 站方改版時只需要修改這個檔（或在設定頁「進階」修改端點範本）。
 import { Capacitor, CapacitorHttp } from '@capacitor/core'
+import { App as CapApp } from '@capacitor/app'
 import { Filesystem, Directory } from '@capacitor/filesystem'
 import { NhWebFetch } from 'nh-webfetch'
 import { AppError, E } from './errors.js'
-import { fillTemplate, hostOf, isChallengePage, parseGallery, sniffImageExt } from './parse.js'
+import {
+  buildCdnUrl,
+  fillTemplate,
+  hostOf,
+  isApiRetired,
+  isChallengePage,
+  normalizeCdnServer,
+  parseCdnConfig,
+  parseGallery,
+  sniffImageExt,
+} from './parse.js'
 import { settings, DEFAULT_ENDPOINTS } from './settings.js'
 
 const DETAIL_TIMEOUT = 10_000
 const WEBVIEW_TIMEOUT = 20_000 // 不含原生端等待 challenge 自動通過的 15 秒
 const CHALLENGE_URL = 'https://nhentai.net/'
 const COVER_TIMEOUT = 20_000
-const MIN_INTERVAL = 1_000 // 全局節流：同時只 1 個請求、間隔至少 1 秒
+// 全局節流：同時只 1 個請求、間隔至少 3 秒（API v2 詳情匿名上限 20 次／分鐘／IP）
+const MIN_INTERVAL = 3_000
 const MAX_COVER_BYTES = 5 * 1024 * 1024
-export const RAW_FORMAT = 'api-v1'
+const CDN_CACHE_TTL = 24 * 60 * 60 * 1000
+export const RAW_FORMAT = 'api-v2'
+const PROJECT_URL = 'https://github.com/anson669989/NH-Shelfie'
 
 const MOBILE_UA =
   'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36'
@@ -23,19 +37,31 @@ let logger = null
 export function setFetchLogger(fn) {
   logger = fn
 }
-let modeRecorder = null
-/** 由服務層注入：auto 模式成功方式改變時持久化 (mode: 'native'|'webview') => Promise */
-export function setModeRecorder(fn) {
-  modeRecorder = fn
+let settingWriter = null
+/** 由服務層注入設定持久化函式 (key, value) => Promise；本檔不直接碰資料庫 */
+export function setSettingWriter(fn) {
+  settingWriter = fn
 }
-function rememberMode(via) {
-  if (settings.last_fetch_ok === via) return
-  settings.last_fetch_ok = via
+function persist(key, value) {
+  settings[key] = value
   try {
-    Promise.resolve(modeRecorder?.(via)).catch(() => {})
+    Promise.resolve(settingWriter?.(key, value)).catch(() => {})
   } catch {
     /* 持久化失敗不影響主流程 */
   }
+}
+function rememberMode(via) {
+  if (settings.last_fetch_ok !== via) persist('last_fetch_ok', via)
+}
+
+// ---------- User-Agent（站方要求具描述性：AppName/version (contact or project URL)）----------
+let uaPromise = null
+function appUserAgent() {
+  uaPromise ??= CapApp.getInfo()
+    .then((i) => i?.version || '0')
+    .catch(() => '0')
+    .then((v) => `NH-Shelfie/${v} (+${PROJECT_URL})`)
+  return uaPromise
 }
 function log(entry) {
   try {
@@ -178,6 +204,10 @@ function interpretDetail({ status, contentType, data, retryAfter }) {
     blockedUntil = Date.now() + sec * 1000
     throw new AppError(E.RATE_LIMITED, { httpStatus: status, retryAfter: sec })
   }
+  if (isApiRetired({ status, body: typeof data === 'string' ? data : '' })) {
+    // 舊 API 停用（403 text/plain「Use new API」）：是格式問題，不是被 Cloudflare 擋
+    throw new AppError(E.BAD_FORMAT, { httpStatus: status, reason: 'api retired' })
+  }
   if (typeof data === 'string' && isChallengePage({ status, contentType, body: data })) {
     throw new AppError(E.BLOCKED, { httpStatus: status })
   }
@@ -212,8 +242,7 @@ function mapWebFetchError(err) {
   return mapped
 }
 
-async function requestDetailWebView(id, step) {
-  const url = fillTemplate(endpoint('endpoint_detail'), { id })
+async function requestWebView(url, step) {
   assertAllowed(url)
   let res
   try {
@@ -231,14 +260,13 @@ async function requestDetailWebView(id, step) {
   return { data, status: res.status }
 }
 
-async function requestDetailNative(id, useMobileUa, step) {
-  const url = fillTemplate(endpoint('endpoint_detail'), { id })
+async function requestNative(url, useMobileUa, step) {
   assertAllowed(url)
   let res
   try {
     res = await CapacitorHttp.get({
       url,
-      headers: { Accept: 'application/json', ...(useMobileUa ? { 'User-Agent': MOBILE_UA } : {}) },
+      headers: { Accept: 'application/json', 'User-Agent': useMobileUa ? MOBILE_UA : await appUserAgent() },
       connectTimeout: DETAIL_TIMEOUT,
       readTimeout: DETAIL_TIMEOUT,
       responseType: 'json',
@@ -316,8 +344,9 @@ export async function fetchDetail(id) {
       const startedAt = Date.now()
       trace.attempts.push(step)
       try {
+        const url = fillTemplate(endpoint('endpoint_detail'), { id })
         const { data, status } =
-          via === 'webview' ? await requestDetailWebView(id, step) : await requestDetailNative(id, attempt.ua, step)
+          via === 'webview' ? await requestWebView(url, step) : await requestNative(url, attempt.ua, step)
         step.ms = Date.now() - startedAt
         const meta = parseGallery(data, RAW_FORMAT)
         step.ok = true
@@ -378,27 +407,97 @@ export async function clearSession() {
   nativeBlocked = false
 }
 
+// ---------- CDN 伺服器清單 ----------
+function readCdnCache() {
+  try {
+    const c = JSON.parse(settings.cdn_cache || 'null')
+    if (!c || c.src !== endpoint('endpoint_cdn') || !Array.isArray(c.servers)) return null
+    const servers = c.servers.map(normalizeCdnServer).filter(Boolean)
+    return servers.length ? { at: Number(c.at) || 0, servers } : null
+  } catch {
+    return null
+  }
+}
+
+function errCode(err) {
+  return err instanceof AppError ? err.code : null
+}
+
+let cdnInflight = null
+/**
+ * 取得封面（縮圖）伺服器清單（GET endpoint_cdn）。快取在 settings.cdn_cache，24 小時內不重抓；
+ * 抓取失敗時沿用過期的快取。
+ * @returns {Promise<string[]>}
+ */
+export async function getThumbServers() {
+  const cached = readCdnCache()
+  if (cached && Date.now() - cached.at < CDN_CACHE_TTL) return cached.servers
+  cdnInflight ??= schedule(async () => {
+    const url = endpoint('endpoint_cdn')
+    const order = settings.fetch_mode === 'webview' || nativeBlocked ? ['webview'] : ['native', 'webview']
+    let lastErr
+    for (const via of order) {
+      const step = {}
+      try {
+        if (lastErr) await sleep(MIN_INTERVAL)
+        const { data, status } = via === 'webview' ? await requestWebView(url, step) : await requestNative(url, false, step)
+        const { thumbServers } = parseCdnConfig(data)
+        persist('cdn_cache', JSON.stringify({ src: url, at: Date.now(), servers: thumbServers }))
+        log({ gallery_id: null, kind: 'cdn', http_status: status, error_code: null })
+        return thumbServers
+      } catch (err) {
+        lastErr = err instanceof AppError ? err : classifyNetworkError(err)
+        if (lastErr.code !== E.BLOCKED) break // 只有被擋才改走 WebView
+      }
+    }
+    log({ gallery_id: null, kind: 'cdn', http_status: lastErr.httpStatus ?? null, error_code: lastErr.code })
+    throw lastErr
+  }).finally(() => {
+    cdnInflight = null
+  })
+  try {
+    return await cdnInflight
+  } catch (err) {
+    if (cached && errCode(err) !== E.RATE_LIMITED) return cached.servers
+    throw err
+  }
+}
+
 // ---------- 封面 ----------
 /**
  * 以原生下載把封面存到快取目錄（不經 base64 橋接），並驗證檔頭與大小。
- * @param {{mediaId:string, coverExt:string}} meta
+ * 網址＝CDN 縮圖伺服器 + meta.coverPath（原樣使用，不猜副檔名）。
+ * 逾時／連線失敗才換下一台伺服器，最多試 2 台；CDN 回 429 視為退避訊號。
+ * @param {{coverPath:string}} meta
  * @param {string} cachePath 例如 preview/123456.tmp（相對於 Directory.Cache）
- * @returns {Promise<{path:string, ext:string}>} 實際格式依檔頭判斷
+ * @returns {Promise<{path:string, ext:string, url:string}>} 實際格式依檔頭判斷
  */
 export async function downloadCover(galleryId, meta, cachePath) {
+  if (!meta?.coverPath) throw new AppError(E.COVER_FAILED, { cause: E.BAD_FORMAT })
+  let servers
+  try {
+    servers = await getThumbServers() // 自己會經 schedule()，不可在下方的 schedule 內呼叫（會互等）
+  } catch (err) {
+    if (errCode(err) === E.RATE_LIMITED) throw err
+    throw new AppError(E.COVER_FAILED, { cause: errCode(err) || E.UNKNOWN })
+  }
+  const ua = await appUserAgent()
   return schedule(async () => {
-    const url = fillTemplate(endpoint('endpoint_cover'), { media_id: meta.mediaId, ext: meta.coverExt })
-    assertAllowed(url)
     let lastErr
-    for (let attempt = 0; attempt < 2; attempt++) {
+    let url = ''
+    const tries = servers.slice(0, 2)
+    for (let i = 0; i < tries.length; i++) {
       try {
-        if (attempt) await sleep(MIN_INTERVAL)
+        if (i) await sleep(MIN_INTERVAL)
+        url = buildCdnUrl(tries[i], meta.coverPath)
+        assertAllowed(url)
         await Promise.race([
           Filesystem.downloadFile({
             url,
             path: cachePath,
             directory: Directory.Cache,
             recursive: true,
+            headers: { 'User-Agent': ua },
             connectTimeout: COVER_TIMEOUT,
             readTimeout: COVER_TIMEOUT,
           }),
@@ -412,14 +511,19 @@ export async function downloadCover(galleryId, meta, cachePath) {
         const ext = sniffImageExt(typeof file.data === 'string' ? file.data : new Uint8Array(await file.data.arrayBuffer()))
         if (!ext) throw new AppError(E.COVER_FAILED, { reason: 'not image' })
         log({ gallery_id: galleryId, kind: 'cover', http_status: 200, error_code: null })
-        return { path: cachePath, ext }
+        return { path: cachePath, ext, url }
       } catch (err) {
-        lastErr = err instanceof AppError ? err : classifyNetworkError(err)
-        if (lastErr.code !== E.TIMEOUT) break
+        if (err instanceof AppError) lastErr = err
+        else if (/\b429\b|Too Many Requests/i.test(String(err?.message || err))) {
+          blockedUntil = Date.now() + 30_000
+          lastErr = new AppError(E.RATE_LIMITED, { httpStatus: 429, retryAfter: 30 })
+        } else lastErr = classifyNetworkError(err)
+        if (![E.TIMEOUT, E.OFFLINE].includes(lastErr.code)) break
       }
     }
     await Filesystem.deleteFile({ path: cachePath, directory: Directory.Cache }).catch(() => {})
-    log({ gallery_id: galleryId, kind: 'cover', http_status: null, error_code: lastErr.code })
-    throw new AppError(E.COVER_FAILED, { cause: lastErr.code })
+    log({ gallery_id: galleryId, kind: 'cover', http_status: lastErr.httpStatus ?? null, error_code: lastErr.code })
+    if (lastErr.code === E.RATE_LIMITED) throw lastErr
+    throw new AppError(E.COVER_FAILED, { cause: lastErr.code, url })
   })
 }

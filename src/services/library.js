@@ -5,14 +5,15 @@ import { Filesystem, Directory, Encoding } from '@capacitor/filesystem'
 import { Share } from '@capacitor/share'
 import { initDb, query, run, transaction } from './db.js'
 import { AppError, E, toAppError } from './errors.js'
-import { normalizeFolderName } from './parse.js'
+import { normalizeFolderName, parseGallery } from './parse.js'
 import { buildCsv, validateCsv, CSV_MAX_BYTES } from './csv.js'
-import { loadSettings, setSetting, settings } from './settings.js'
+import { loadSettings, migrateSettings, setSetting, settings } from './settings.js'
 import {
+  RAW_FORMAT,
   fetchDetail,
   downloadCover,
   setFetchLogger,
-  setModeRecorder,
+  setSettingWriter,
   galleryPageUrl,
   showChallenge,
   clearSession,
@@ -36,8 +37,9 @@ let cacheBaseSrc = ''
 export async function initLibrary() {
   await initDb()
   await loadSettings()
+  await migrateSettings()
   setFetchLogger(writeFetchLog)
-  setModeRecorder((mode) => setSetting('last_fetch_ok', mode))
+  setSettingWriter(setSetting)
 
   await Filesystem.mkdir({ path: COVERS_DIR, directory: Directory.Data, recursive: true }).catch(() => {})
   await Filesystem.writeFile({
@@ -248,14 +250,11 @@ export async function deleteBook(id) {
 
 /** 長按「重新抓封面」 */
 export async function refetchCover(id) {
-  let book = await getBook(id)
+  const book = await getBook(id)
   if (!book) return
-  if (!book.media_id) {
-    await fillDetail(book)
-    book = await getBook(id)
-  }
+  const meta = await coverMetaFor(book)
   const tmp = `refetch/${id}-${Date.now()}.tmp`
-  const res = await downloadCover(id, { mediaId: book.media_id, coverExt: book.cover_ext || 'jpg' }, tmp)
+  const res = await downloadCover(id, meta, tmp)
   await deleteCoverFile(book.cover_path)
   const path = await moveCacheToCovers(res.path, id, res.ext)
   await run(
@@ -263,6 +262,25 @@ export async function refetchCover(id) {
     [path, res.ext, id],
   )
   bump()
+}
+
+/**
+ * 下載封面所需的 meta（含 coverPath）。book_raw 已是目前格式（api-v2）就本地解析，
+ * 否則（api-v1 舊資料、CSV 匯入尚無詳情）重抓詳情並覆寫 book_raw。
+ */
+async function coverMetaFor(book) {
+  const raw = (
+    await query('SELECT raw_json, raw_format FROM book_raw WHERE gallery_id = ?', [book.gallery_id])
+  )[0]
+  if (raw?.raw_format === RAW_FORMAT) {
+    try {
+      const m = parseGallery(JSON.parse(raw.raw_json), raw.raw_format)
+      if (m.coverPath) return m
+    } catch {
+      /* 本地資料壞了就重抓 */
+    }
+  }
+  return (await fillDetail(book)).meta
 }
 
 async function fillDetail(book) {
@@ -277,6 +295,7 @@ async function fillDetail(book) {
       values: [book.gallery_id, d.rawJson, d.rawFormat],
     },
   ])
+  return d
 }
 
 export function openUrlFor(id) {
@@ -390,14 +409,10 @@ export async function runQueue() {
       )[0]
       if (!book) break
       try {
-        if (!book.media_id) await fillDetail(book)
+        const meta = await coverMetaFor(book)
         const fresh = await getBook(book.gallery_id)
         try {
-          const res = await downloadCover(
-            book.gallery_id,
-            { mediaId: fresh.media_id, coverExt: fresh.cover_ext || 'jpg' },
-            `refetch/${book.gallery_id}-${Date.now()}.tmp`,
-          )
+          const res = await downloadCover(book.gallery_id, meta, `refetch/${book.gallery_id}-${Date.now()}.tmp`)
           await deleteCoverFile(fresh.cover_path)
           const path = await moveCacheToCovers(res.path, book.gallery_id, res.ext)
           await run(
@@ -465,7 +480,7 @@ export async function resetVerification() {
 
 // ================= 健康檢查 =================
 export async function testConnection() {
-  const id = Number.parseInt(settings.test_id, 10) || 177013
+  const id = Number.parseInt(settings.test_id, 10) || 228922
   const result = { detail: null, cover: null, diagnostics: null }
   let coverDiag = null
   try {
@@ -474,12 +489,12 @@ export async function testConnection() {
     try {
       const res = await downloadCover(id, d.meta, `test/${id}.tmp`)
       result.cover = 'ok'
-      coverDiag = { result: 'ok', mediaId: d.meta.mediaId, ext: d.meta.coverExt }
+      coverDiag = { result: 'ok', coverPath: d.meta.coverPath, url: res.url, ext: res.ext }
       await Filesystem.deleteFile({ path: res.path, directory: Directory.Cache }).catch(() => {})
     } catch (err) {
       const e = toAppError(err)
       result.cover = e.cause || e.code
-      coverDiag = { result: e.code, cause: e.cause ?? null, mediaId: d.meta.mediaId, ext: d.meta.coverExt }
+      coverDiag = { result: e.code, cause: e.cause ?? null, coverPath: d.meta.coverPath, url: e.url ?? null }
     }
   } catch (err) {
     result.detail = toAppError(err).code

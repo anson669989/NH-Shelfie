@@ -125,8 +125,8 @@
           <p class="notice warn small">{{ t('settings.endpointWarning') }}</p>
           <label class="small">{{ t('settings.endpointDetail') }}</label>
           <input v-model="ep.endpoint_detail" class="input mono" spellcheck="false" autocapitalize="off" />
-          <label class="small">{{ t('settings.endpointCover') }}</label>
-          <input v-model="ep.endpoint_cover" class="input mono" spellcheck="false" autocapitalize="off" />
+          <label class="small">{{ t('settings.endpointCdn') }}</label>
+          <input v-model="ep.endpoint_cdn" class="input mono" spellcheck="false" autocapitalize="off" />
           <label class="small">{{ t('settings.endpointPage') }}</label>
           <input v-model="ep.endpoint_page" class="input mono" spellcheck="false" autocapitalize="off" />
           <div class="btn-row">
@@ -345,7 +345,7 @@ async function onVersionTap() {
 async function saveEndpoints() {
   const checks = [
     ['endpoint_detail', ['id']],
-    ['endpoint_cover', ['media_id', 'ext']],
+    ['endpoint_cdn', []],
     ['endpoint_page', ['id']],
   ]
   for (const [k, req] of checks) {

@@ -54,22 +54,34 @@ export function hostOf(tpl) {
 
 const EXT_BY_TYPE = { j: 'jpg', p: 'png', w: 'webp', jpg: 'jpg', jpeg: 'jpg', png: 'png', webp: 'webp' }
 
+export const RAW_FORMATS = Object.freeze(['api-v1', 'api-v2'])
+
 /**
  * 寬鬆解析 nhentai 詳情回應，輸出固定的 BookMeta。
- * 必要欄位（media_id、封面類型）缺少時丟 BAD_FORMAT。
+ * 必要欄位（media_id、封面類型／路徑）缺少時丟 BAD_FORMAT。
+ * - api-v1：舊 `/api/gallery/{id}`（站方已停用；保留給已存的 book_raw）
+ * - api-v2：`/api/v2/galleries/{id}`，另輸出 `coverPath`（CDN 相對路徑，原樣使用）
  * @param {object} json
  * @param {string} rawFormat 回應版本標記，日後格式變動時依版本選解析器
  */
 export function parseGallery(json, rawFormat = 'api-v1') {
-  if (rawFormat !== 'api-v1') throw new AppError(E.BAD_FORMAT, { reason: 'unknown raw_format' })
+  if (!RAW_FORMATS.includes(rawFormat)) throw new AppError(E.BAD_FORMAT, { reason: 'unknown raw_format' })
   if (!json || typeof json !== 'object') throw new AppError(E.BAD_FORMAT, { reason: 'not object' })
 
   const mediaId = json.media_id != null ? String(json.media_id) : ''
   if (!/^\d+$/.test(mediaId)) throw new AppError(E.BAD_FORMAT, { reason: 'media_id' })
 
-  const coverType = json.images?.cover?.t
-  const coverExt = EXT_BY_TYPE[String(coverType || '').toLowerCase()]
-  if (!coverExt) throw new AppError(E.BAD_FORMAT, { reason: 'cover type' })
+  let coverExt
+  let coverPath = null
+  if (rawFormat === 'api-v2') {
+    const c = parseCoverPath(json.cover?.path)
+    if (!c || c.mediaId !== mediaId) throw new AppError(E.BAD_FORMAT, { reason: 'cover path' })
+    coverExt = c.ext
+    coverPath = c.path
+  } else {
+    coverExt = EXT_BY_TYPE[String(json.images?.cover?.t || '').toLowerCase()]
+    if (!coverExt) throw new AppError(E.BAD_FORMAT, { reason: 'cover type' })
+  }
 
   const t = json.title || {}
   const title = pickStr(t.pretty) || pickStr(t.english) || pickStr(t.japanese) || ''
@@ -86,6 +98,7 @@ export function parseGallery(json, rawFormat = 'api-v1') {
     galleryId: Number.isSafeInteger(galleryId) ? galleryId : null,
     mediaId,
     coverExt,
+    coverPath,
     title,
     titleJa,
     tags,
@@ -94,6 +107,64 @@ export function parseGallery(json, rawFormat = 'api-v1') {
 
 function pickStr(v) {
   return typeof v === 'string' && v.trim() ? v.trim() : ''
+}
+
+// v2 封面相對路徑，例 galleries/1205270/cover.jpg、galleries/4301004/cover.jpg.webp
+const COVER_PATH_RE = /^galleries\/(\d{1,12})\/cover\.([a-z0-9]{2,5})(?:\.([a-z0-9]{2,5}))?$/i
+
+/**
+ * 驗證 v2 的 cover.path。只接受已知格式；實際格式取最後一段副檔名（jpg.webp → webp）。
+ * @returns {{path:string, mediaId:string, ext:string}|null}
+ */
+export function parseCoverPath(path) {
+  if (typeof path !== 'string') return null
+  const m = path.match(COVER_PATH_RE)
+  if (!m) return null
+  const ext = EXT_BY_TYPE[(m[3] || m[2]).toLowerCase()]
+  if (!ext) return null
+  return { path, mediaId: m[1], ext }
+}
+
+/** CDN 伺服器字串 → 正規化 origin；只接受 https、nhentai.net 子網域，不可帶路徑／帳密／埠號／查詢字串。 */
+export function normalizeCdnServer(server) {
+  let u
+  try {
+    u = new URL(String(server))
+  } catch {
+    return null
+  }
+  if (u.protocol !== 'https:' || u.username || u.password || u.port || u.search || u.hash) return null
+  if (u.pathname !== '/' && u.pathname !== '') return null
+  const host = u.hostname.toLowerCase()
+  if (!(host === 'nhentai.net' || host.endsWith('.nhentai.net'))) return null
+  return `https://${host}`
+}
+
+/**
+ * 解析 `GET /api/v2/cdn` 的 CdnConfigResponse，只留合法的縮圖伺服器。
+ * @returns {{thumbServers: string[]}}
+ */
+export function parseCdnConfig(json) {
+  if (!json || typeof json !== 'object' || !Array.isArray(json.thumb_servers)) {
+    throw new AppError(E.BAD_FORMAT, { reason: 'cdn config' })
+  }
+  const thumbServers = [...new Set(json.thumb_servers.map(normalizeCdnServer).filter(Boolean))]
+  if (!thumbServers.length) throw new AppError(E.BAD_FORMAT, { reason: 'cdn servers' })
+  return { thumbServers }
+}
+
+/** 封面網址＝白名單 CDN 伺服器 + 通過驗證的 cover.path（原樣使用，不猜副檔名）。 */
+export function buildCdnUrl(server, coverPath) {
+  const origin = normalizeCdnServer(server)
+  if (!origin || !parseCoverPath(coverPath)) throw new AppError(E.ENDPOINT_INVALID, { server, coverPath })
+  return `${origin}/${coverPath}`
+}
+
+/** 舊 API 停用時的回應：403／410 且內文含「Use new API」（不是被 Cloudflare 擋）。 */
+export function isApiRetired({ status, body } = {}) {
+  if (status !== 403 && status !== 410) return false
+  const text = typeof body === 'string' ? body.slice(0, 4096) : ''
+  return /Use new API/i.test(text)
 }
 
 /** 以檔頭判斷圖片格式；接受 base64 字串或 Uint8Array。 */
