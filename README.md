@@ -27,14 +27,15 @@ NH 本地收藏管理器：一個在手機本地運行、不經任何自建伺�
 | --- | --- |
 | 資料夾 | 頂部下拉選單切換「全部」「未分類」與自建資料夾（顯示本數）；封面牆（虛擬捲動，可調 2–5 欄）；每個資料夾各自記住排序（加入時間、ID、書名）；點封面以 Custom Tab 開網頁；長按封面可加入／移出資料夾、重抓封面、刪除；選單內每個資料夾的「⋯」可改名、刪除、上下移動，也可直接新增資料夾 |
 | 新增 | 輸入 ID 或貼上網址 → 按「完成」／「查詢」才抓取（不會在打字途中自動發請求）→ 預覽封面與書名 → 多選資料夾（可現場新增）→ 加入收藏；已收藏的 ID 在本機即時提示、不上網 |
-| 設定 | 主題顏色、深淺色、語言（繁中／English／日本語）、使用說明；CSV 匯出／匯入（換機用）、待抓佇列、重抓缺少的封面、封面占用空間；進階：可修改站方端點、測試連線、最近 50 次抓取成功率 |
+| 設定 | 主題顏色、深淺色、語言（繁中／English／日本語）、使用說明；CSV 匯出／匯入（換機用）、待抓佇列、重抓缺少的封面、封面占用空間；進階：測試連線；連點「關於 → 版本」7 次開啟開發者模式，可修改站方端點、看最近 50 次抓取成功率、切換抓取方式、重設驗證 |
+| 驗證畫面 | 站方開啟 Cloudflare 安全驗證時，App 會先在背景 WebView 自動嘗試；過不了才出現「進行驗證」按鈕，開啟全螢幕驗證畫面讓你手動完成，通過後自動重試 |
 
 ### 對應架構文件的實作重點
 
 - **轉接層**：所有對站方的請求與解析集中在 [`src/services/nhSource.js`](src/services/nhSource.js)，對內只輸出固定的 BookMeta；端點範本存在 settings，可在設定頁修改。
-- **原生網路**：詳情走 `CapacitorHttp`，封面用 `Filesystem.downloadFile` 原生下載到快取目錄（不經 base64 橋接），按「加入收藏」才搬進 `covers/`。
+- **原生網路**：詳情先走 `CapacitorHttp`；被 Cloudflare 擋下時改用本地外掛 [`plugins/nh-webfetch`](plugins/nh-webfetch) 的獨立 WebView（不接 Capacitor bridge，回傳通道只對 `https://nhentai.net` 開放）在站方頁面內抓 API。封面用 `Filesystem.downloadFile` 原生下載到快取目錄（不經 base64 橋接），按「加入收藏」才搬進 `covers/`。
 - **全局節流**：同時只 1 個請求、間隔至少 1 秒；HTTP 429 依 `Retry-After` 倒數。
-- **例外處理**：詳情 404／被擋／格式不符時不存入；只有封面失敗才以灰底問號封面存入。逾時自動重試 1 次；被擋時改帶手機瀏覽器 User-Agent 重試 1 次。
+- **例外處理**：詳情 404／被擋／格式不符時不存入；只有封面失敗才以灰底問號封面存入。逾時自動重試 1 次；被擋時改走 WebView 驗證抓取（設定的抓取方式為「原生」時則改帶手機瀏覽器 User-Agent 重試 1 次）。
 - **不留半套資料**：先存封面檔 → 單一交易寫 `books`、`book_raw`、`book_folders`；失敗就刪封面檔。啟動時清掉孤兒封面檔。
 - **資料模型**：SQLite（`books`、`book_raw`、`folders`、`book_folders`、`settings`、`fetch_log`），`raw_json` 獨立存放並以 `raw_format` 標版本，日後做標籤搜尋（路線 B）可直接本地解析、不必重抓。schema 以 `PRAGMA user_version` 逐版遷移，遷移前自動備份。
 - **安全**：所有外部文字一律純文字渲染（不使用 `v-html`）；CSP 只允許自身腳本與本機圖片；只允許 HTTPS、請求只送往白名單網域；ID 先轉整數再套範本；封面以檔頭驗證 JPG／PNG／WebP、上限 5 MB；全部參數化查詢；CSV 匯出防公式注入；只申請 `INTERNET` 權限；關閉 `allowBackup`；封面目錄放 `.nomedia`。
@@ -43,7 +44,7 @@ NH 本地收藏管理器：一個在手機本地運行、不經任何自建伺�
 ### 尚未包含（依里程碑之後再做）
 
 - M4 詳情頁（標籤顯示＋個人備註）、M5 路線 B（標籤搜尋與篩選）
-- Cloudflare 備援方案 2、3（WebView 過驗證、手動指定封面）——目前只做直接擷取與 UA 重試，可從設定頁的抓取成功率判斷是否需要
+- Cloudflare 備援方案 3（手動指定封面）
 - 隱藏最近使用畫面（FLAG_SECURE）、App 開啟鎖、自動覆寫 CSV 到指定資料夾
 - iOS 版
 
@@ -111,6 +112,7 @@ npm run android:open     # 用 Android Studio 開啟，接手機執行
 ```
 .github/workflows/build-apk.yml  建置與發佈 APK
 scripts/patch-android.mjs        對產生的 Android 專案套用設定
+plugins/nh-webfetch/             本地 Capacitor 外掛：WebView 驗證抓取（Java）
 capacitor.config.json            App ID、名稱、外掛設定
 index.html                       含 CSP
 src/
