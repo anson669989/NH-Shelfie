@@ -464,33 +464,90 @@ export async function getThumbServers() {
 }
 
 // ---------- 封面 ----------
+// 最近一次 downloadCover 的逐次嘗試紀錄，只存記憶體；「測試連線」的診斷顯示
+let lastCoverTrace = null
+/** @returns {object|null} 最近一次 downloadCover 的診斷紀錄（複本） */
+export function getLastCoverTrace() {
+  return lastCoverTrace ? JSON.parse(JSON.stringify(lastCoverTrace)) : null
+}
+
+/** 外掛丟出的原始錯誤 → 純文字欄位（不推測原因） */
+function rawErrorInfo(err) {
+  const out = {}
+  if (err == null) return out
+  const msg = err.message ?? err.errorMessage ?? (typeof err === 'string' ? err : '')
+  if (msg) out.message = String(msg).slice(0, TRACE_TEXT_CHARS)
+  if (err.code != null) out.pluginCode = String(err.code)
+  if (err.data != null) out.data = bodyHead(err.data)
+  const m = String(msg).match(/\b([1-5]\d\d)\b/)
+  if (m) out.statusInMessage = Number(m[1])
+  return out
+}
+
+/** 診斷用：對同一網址發 HEAD，取回真正的 HTTP 狀態碼（呼叫端負責間隔）。 */
+async function probeHead(url, ua) {
+  const startedAt = Date.now()
+  try {
+    const res = await CapacitorHttp.request({
+      method: 'HEAD',
+      url,
+      headers: { 'User-Agent': ua },
+      connectTimeout: DETAIL_TIMEOUT,
+      readTimeout: DETAIL_TIMEOUT,
+    })
+    return {
+      status: res.status,
+      contentType: header(res, 'content-type'),
+      contentLength: header(res, 'content-length'),
+      server: header(res, 'server'),
+      ms: Date.now() - startedAt,
+    }
+  } catch (err) {
+    return { error: true, ...rawErrorInfo(err), ms: Date.now() - startedAt }
+  }
+}
+
 /**
  * 以原生下載把封面存到快取目錄（不經 base64 橋接），並驗證檔頭與大小。
  * 網址＝CDN 縮圖伺服器 + meta.coverPath（原樣使用，不猜副檔名）。
- * 逾時／連線失敗才換下一台伺服器，最多試 2 台；CDN 回 429 視為退避訊號。
+ * 失敗就依 /api/v2/cdn 的順序換下一台伺服器，直到全部試過；每次之間至少 MIN_INTERVAL。
+ * CDN 回 429 視為退避訊號，立即停止。
  * @param {{coverPath:string}} meta
  * @param {string} cachePath 例如 preview/123456.tmp（相對於 Directory.Cache）
+ * @param {{diagnose?:boolean}} [opts] diagnose：下載失敗後再發一次 HEAD 取得 HTTP 狀態碼（只給「測試連線」用）
  * @returns {Promise<{path:string, ext:string, url:string}>} 實際格式依檔頭判斷
  */
-export async function downloadCover(galleryId, meta, cachePath) {
-  if (!meta?.coverPath) throw new AppError(E.COVER_FAILED, { cause: E.BAD_FORMAT })
+export async function downloadCover(galleryId, meta, cachePath, { diagnose = false } = {}) {
+  const trace = { galleryId, coverPath: meta?.coverPath ?? null, servers: [], attempts: [], result: null }
+  lastCoverTrace = trace
+  if (!meta?.coverPath) {
+    trace.result = E.BAD_FORMAT
+    throw new AppError(E.COVER_FAILED, { cause: E.BAD_FORMAT })
+  }
   let servers
   try {
     servers = await getThumbServers() // 自己會經 schedule()，不可在下方的 schedule 內呼叫（會互等）
   } catch (err) {
+    trace.result = `cdn:${errCode(err) || E.UNKNOWN}`
     if (errCode(err) === E.RATE_LIMITED) throw err
     throw new AppError(E.COVER_FAILED, { cause: errCode(err) || E.UNKNOWN })
   }
+  trace.servers = [...servers]
   const ua = await appUserAgent()
+  trace.userAgent = ua
   return schedule(async () => {
     let lastErr
     let url = ''
-    const tries = servers.slice(0, 2)
-    for (let i = 0; i < tries.length; i++) {
+    for (let i = 0; i < servers.length; i++) {
+      const step = { host: null, url: null, uaSent: true }
+      trace.attempts.push(step)
+      const startedAt = Date.now()
       try {
         if (i) await sleep(MIN_INTERVAL)
-        url = buildCdnUrl(tries[i], meta.coverPath)
+        url = buildCdnUrl(servers[i], meta.coverPath)
         assertAllowed(url)
+        step.url = url
+        step.host = new URL(url).hostname
         await Promise.race([
           Filesystem.downloadFile({
             url,
@@ -506,22 +563,47 @@ export async function downloadCover(galleryId, meta, cachePath) {
           }),
         ])
         const st = await Filesystem.stat({ path: cachePath, directory: Directory.Cache })
+        step.bytes = st.size ?? null
         if (!st.size || st.size > MAX_COVER_BYTES) throw new AppError(E.COVER_FAILED, { reason: 'size' })
         const file = await Filesystem.readFile({ path: cachePath, directory: Directory.Cache })
         const ext = sniffImageExt(typeof file.data === 'string' ? file.data : new Uint8Array(await file.data.arrayBuffer()))
         if (!ext) throw new AppError(E.COVER_FAILED, { reason: 'not image' })
+        step.ok = true
+        step.ext = ext
+        step.ms = Date.now() - startedAt
+        trace.result = 'ok'
         log({ gallery_id: galleryId, kind: 'cover', http_status: 200, error_code: null })
         return { path: cachePath, ext, url }
       } catch (err) {
-        if (err instanceof AppError) lastErr = err
-        else if (/\b429\b|Too Many Requests/i.test(String(err?.message || err))) {
+        step.ms = Date.now() - startedAt
+        Object.assign(step, rawErrorInfo(err))
+        if (err instanceof AppError) {
+          lastErr = err
+          if (err.reason) step.reason = err.reason
+        } else if (/\b429\b|Too Many Requests/i.test(String(err?.message || err))) {
           blockedUntil = Date.now() + 30_000
           lastErr = new AppError(E.RATE_LIMITED, { httpStatus: 429, retryAfter: 30 })
-        } else lastErr = classifyNetworkError(err)
-        if (![E.TIMEOUT, E.OFFLINE].includes(lastErr.code)) break
+        } else if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+          lastErr = new AppError(E.OFFLINE)
+        } else {
+          // 不再一律歸成 OFFLINE：原始訊息已記在 step.message / pluginCode
+          lastErr = new AppError(E.COVER_FAILED, { reason: 'download' })
+        }
+        step.error = lastErr.code
+        await Filesystem.deleteFile({ path: cachePath, directory: Directory.Cache }).catch(() => {})
+        if (lastErr.code === E.RATE_LIMITED) break
+        if (diagnose && step.url) {
+          await sleep(MIN_INTERVAL)
+          step.probe = await probeHead(step.url, ua)
+          if (step.probe.status === 429) {
+            blockedUntil = Date.now() + 30_000
+            lastErr = new AppError(E.RATE_LIMITED, { httpStatus: 429, retryAfter: 30 })
+            break
+          }
+        }
       }
     }
-    await Filesystem.deleteFile({ path: cachePath, directory: Directory.Cache }).catch(() => {})
+    trace.result = lastErr.code
     log({ gallery_id: galleryId, kind: 'cover', http_status: lastErr.httpStatus ?? null, error_code: lastErr.code })
     if (lastErr.code === E.RATE_LIMITED) throw lastErr
     throw new AppError(E.COVER_FAILED, { cause: lastErr.code, url })

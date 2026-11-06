@@ -18,6 +18,7 @@ import {
   showChallenge,
   clearSession,
   getLastDetailTrace,
+  getLastCoverTrace,
 } from './nhSource.js'
 
 const COVERS_DIR = 'covers'
@@ -487,18 +488,18 @@ export async function testConnection() {
     const d = await fetchDetail(id)
     result.detail = 'ok'
     try {
-      const res = await downloadCover(id, d.meta, `test/${id}.tmp`)
+      const res = await downloadCover(id, d.meta, `test/${id}.tmp`, { diagnose: true })
       result.cover = 'ok'
-      coverDiag = { result: 'ok', coverPath: d.meta.coverPath, url: res.url, ext: res.ext }
       await Filesystem.deleteFile({ path: res.path, directory: Directory.Cache }).catch(() => {})
     } catch (err) {
       const e = toAppError(err)
-      result.cover = e.cause || e.code
-      coverDiag = { result: e.code, cause: e.cause ?? null, coverPath: d.meta.coverPath, url: e.url ?? null }
+      // 介面以 errText 顯示，只能給已知錯誤碼；原始錯誤在診斷的 cover.attempts
+      result.cover = Object.values(E).includes(e.cause) ? e.cause : e.code
     }
   } catch (err) {
     result.detail = toAppError(err).code
   }
+  if (result.detail === 'ok') coverDiag = getLastCoverTrace() // 詳情失敗時沒有試封面，不顯示舊紀錄
   // 開發者模式顯示用；只存在這次回傳值，不寫入資料庫
   result.diagnostics = JSON.stringify(
     { app: Capacitor.getPlatform(), testId: id, detail: getLastDetailTrace(), cover: coverDiag },
