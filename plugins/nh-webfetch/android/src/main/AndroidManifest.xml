@@ -1,0 +1,3 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- 不宣告任何權限：只用 App 既有的 INTERNET -->
+</manifest>

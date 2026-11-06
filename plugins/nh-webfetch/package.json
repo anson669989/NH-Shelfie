@@ -1,0 +1,22 @@
+{
+  "name": "nh-webfetch",
+  "version": "0.1.1",
+  "private": true,
+  "description": "NH Shelfie 本地外掛：以獨立、隱藏的 WebView 通過 Cloudflare 驗證後抓取 nhentai API。",
+  "type": "module",
+  "main": "src/index.js",
+  "module": "src/index.js",
+  "files": [
+    "src/",
+    "android/build.gradle",
+    "android/src/"
+  ],
+  "peerDependencies": {
+    "@capacitor/core": "^7.0.0"
+  },
+  "capacitor": {
+    "android": {
+      "src": "android"
+    }
+  }
+}

@@ -1,8 +1,8 @@
 node_modules/
 dist/
 # android/ 由 GitHub Action 以 `npx cap add android` 產生，再用 scripts/patch-android.mjs 套設定
-android/
-ios/
+/android/
+/ios/
 *.keystore
 *.jks
 keystore.properties
