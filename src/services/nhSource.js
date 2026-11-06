@@ -1,6 +1,6 @@
 // 轉接層：所有對 nhentai 的請求與解析都集中在這裡，對內只輸出固定的 BookMeta。
 // 站方改版時只需要修改這個檔（或在設定頁「進階」修改端點範本）。
-import { CapacitorHttp } from '@capacitor/core'
+import { Capacitor, CapacitorHttp } from '@capacitor/core'
 import { Filesystem, Directory } from '@capacitor/filesystem'
 import { NhWebFetch } from 'nh-webfetch'
 import { AppError, E } from './errors.js'
@@ -100,6 +100,57 @@ export function galleryPageUrl(id) {
   return url
 }
 
+// ---------- 診斷（任務 003）----------
+// 最近一次 fetchDetail 的嘗試紀錄，只存記憶體；開發者模式的「測試連線」顯示並可複製。
+const TRACE_TEXT_CHARS = 300
+let lastTrace = null
+
+/** 回應開頭若干字，一律轉成純文字字串 */
+function bodyHead(data) {
+  if (data == null) return ''
+  let s
+  if (typeof data === 'string') s = data
+  else {
+    try {
+      s = JSON.stringify(data)
+    } catch {
+      s = String(data)
+    }
+  }
+  return s.slice(0, TRACE_TEXT_CHARS)
+}
+
+// 外掛回傳的診斷欄位（NhWebFetchPlugin.diag）；只挑已知欄位
+const PLUGIN_DIAG_KEYS = [
+  'href',
+  'title',
+  'stage',
+  'reloaded',
+  'probeHref',
+  'probeTitle',
+  'readyTitle',
+  'mainFrameError',
+  'webMessageListener',
+  'webViewVersion',
+  'status',
+  'contentType',
+  'bodyHead',
+]
+function pickPluginDiag(obj, skip = []) {
+  const out = {}
+  if (!obj || typeof obj !== 'object') return out
+  for (const k of PLUGIN_DIAG_KEYS) {
+    if (skip.includes(k) || obj[k] === undefined || obj[k] === null) continue
+    out[k] = typeof obj[k] === 'string' ? obj[k].slice(0, TRACE_TEXT_CHARS) : obj[k]
+  }
+  return out
+}
+
+/** @returns {object|null} 最近一次 fetchDetail 的診斷紀錄（複本） */
+export function getLastDetailTrace() {
+  return lastTrace ? JSON.parse(JSON.stringify(lastTrace)) : null
+}
+
 // ---------- 詳情 ----------
 function header(res, name) {
   const h = res.headers || {}
@@ -148,15 +199,20 @@ function interpretDetail({ status, contentType, data, retryAfter }) {
 /** 把 NhWebFetch 外掛的錯誤碼轉成 AppError */
 function mapWebFetchError(err) {
   const code = String(err?.code || '')
-  if (code === 'CHALLENGE_REQUIRED') return new AppError(E.CHALLENGE)
-  if (code === 'TIMEOUT') return new AppError(E.TIMEOUT)
-  if (code === 'NETWORK') return classifyNetworkError(err)
-  if (code === 'INVALID_URL') return new AppError(E.ENDPOINT_INVALID)
-  // UNSUPPORTED（WebView 太舊）、UNIMPLEMENTED（非 Android）等
-  return new AppError(E.BLOCKED, { cause: code || String(err?.message || err) })
+  const extra = { pluginCode: code || null, cause: String(err?.message || err || '') }
+  let mapped
+  if (code === 'CHALLENGE_REQUIRED') mapped = new AppError(E.CHALLENGE, extra)
+  else if (code === 'TIMEOUT') mapped = new AppError(E.TIMEOUT, extra)
+  else if (code === 'NETWORK') mapped = Object.assign(classifyNetworkError(err), extra)
+  else if (code === 'INVALID_URL') mapped = new AppError(E.ENDPOINT_INVALID, extra)
+  // UNSUPPORTED（WebView 太舊）、UNIMPLEMENTED（外掛未註冊／非 Android）、BUSY 等：保留原始 code
+  else mapped = new AppError(E.BLOCKED, extra)
+  const d = pickPluginDiag(err?.data)
+  if (Object.keys(d).length) mapped.pluginDiag = d
+  return mapped
 }
 
-async function requestDetailWebView(id) {
+async function requestDetailWebView(id, step) {
   const url = fillTemplate(endpoint('endpoint_detail'), { id })
   assertAllowed(url)
   let res
@@ -165,11 +221,17 @@ async function requestDetailWebView(id) {
   } catch (err) {
     throw mapWebFetchError(err)
   }
+  Object.assign(step, {
+    status: res.status,
+    contentType: res.contentType || '',
+    bodyHead: bodyHead(res.body),
+    plugin: pickPluginDiag(res, ['status', 'contentType', 'bodyHead']),
+  })
   const data = interpretDetail({ status: res.status, contentType: res.contentType, data: res.body })
   return { data, status: res.status }
 }
 
-async function requestDetailNative(id, useMobileUa) {
+async function requestDetailNative(id, useMobileUa, step) {
   const url = fillTemplate(endpoint('endpoint_detail'), { id })
   assertAllowed(url)
   let res
@@ -182,8 +244,13 @@ async function requestDetailNative(id, useMobileUa) {
       responseType: 'json',
     })
   } catch (err) {
-    throw classifyNetworkError(err)
+    throw Object.assign(classifyNetworkError(err), { cause: String(err?.message || err || '') })
   }
+  Object.assign(step, {
+    status: res.status,
+    contentType: header(res, 'content-type'),
+    bodyHead: bodyHead(res.data),
+  })
   const data = interpretDetail({
     status: res.status,
     contentType: header(res, 'content-type'),
@@ -229,23 +296,49 @@ export async function fetchDetail(id) {
   return schedule(async () => {
     let lastErr
     let via = 'native'
+    const trace = {
+      galleryId: id,
+      at: new Date().toISOString(),
+      fetchMode: settings.fetch_mode || 'auto',
+      lastFetchOk: settings.last_fetch_ok || '',
+      nativeBlocked,
+      platform: Capacitor.getPlatform(),
+      pluginAvailable: Capacitor.isPluginAvailable('NhWebFetch'),
+      attempts: [],
+      result: null,
+    }
+    lastTrace = trace
     for (const attempt of detailAttempts()) {
       if (attempt.onlyIf && lastErr?.code !== attempt.onlyIf) continue
       if (lastErr) await sleep(MIN_INTERVAL)
       via = attempt.via
+      const step = via === 'native' ? { via, ua: !!attempt.ua } : { via }
+      const startedAt = Date.now()
+      trace.attempts.push(step)
       try {
         const { data, status } =
-          via === 'webview' ? await requestDetailWebView(id) : await requestDetailNative(id, attempt.ua)
+          via === 'webview' ? await requestDetailWebView(id, step) : await requestDetailNative(id, attempt.ua, step)
+        step.ms = Date.now() - startedAt
         const meta = parseGallery(data, RAW_FORMAT)
+        step.ok = true
+        trace.result = 'ok'
         if (settings.fetch_mode === 'auto' || !settings.fetch_mode) rememberMode(via)
         log({ gallery_id: id, kind: logKind(via), http_status: status, error_code: null })
         return { meta: { ...meta, galleryId: id }, rawJson: JSON.stringify(data), rawFormat: RAW_FORMAT }
       } catch (err) {
         lastErr = err instanceof AppError ? err : classifyNetworkError(err)
+        step.ms ??= Date.now() - startedAt
+        step.error = lastErr.code
+        if (step.status == null && lastErr.httpStatus != null) step.status = lastErr.httpStatus
+        if (lastErr.pluginCode) step.pluginCode = lastErr.pluginCode
+        const msg = err instanceof AppError ? lastErr.cause : err?.message || err
+        if (msg) step.message = String(msg).slice(0, TRACE_TEXT_CHARS)
+        if (lastErr.pluginDiag) step.plugin = lastErr.pluginDiag
         if (via === 'native' && lastErr.code === E.BLOCKED) nativeBlocked = true
         if ([E.BAD_FORMAT, E.NOT_FOUND, E.RATE_LIMITED, E.CHALLENGE].includes(lastErr.code)) break
       }
     }
+    trace.result = lastErr.code
     log({ gallery_id: id, kind: logKind(via), http_status: lastErr.httpStatus ?? null, error_code: lastErr.code })
     throw lastErr
   })

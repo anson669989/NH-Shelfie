@@ -29,7 +29,10 @@ export function closeTopDialog() {
 export const confirmDialog = (message, { okText, danger = false } = {}) =>
   open('confirm', { message, okText, danger })
 
-export const alertDialog = (message, { title } = {}) => open('alert', { message, title })
+/**
+ * @param {{title?:string, diagnostics?:string}} [opts] diagnostics：額外顯示可捲動、可複製的純文字（開發者模式）
+ */
+export const alertDialog = (message, { title, diagnostics } = {}) => open('alert', { message, title, diagnostics })
 
 /** @returns {Promise<string|null>} */
 export const promptDialog = (title, { value = '', placeholder = '', maxlength = 30, validate } = {}) =>

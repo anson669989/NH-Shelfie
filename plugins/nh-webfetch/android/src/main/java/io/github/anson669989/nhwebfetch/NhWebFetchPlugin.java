@@ -3,6 +3,7 @@ package io.github.anson669989.nhwebfetch;
 import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.Dialog;
+import android.content.pm.PackageInfo;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.Handler;
@@ -101,6 +102,11 @@ public class NhWebFetchPlugin extends Plugin {
         boolean reloaded;
         boolean done;
         Runnable timeout;
+        // 診斷用（任務 003）：最近一次 probe 看到的頁面、isReady 判定通過時的 title
+        String probeHref = "";
+        String probeTitle = "";
+        String readyTitle;
+        String stage = "probe";
     }
 
     // ------------------------------------------------------------------ API
@@ -109,11 +115,11 @@ public class NhWebFetchPlugin extends Plugin {
     public void fetchText(PluginCall call) {
         String url = call.getString("url");
         if (!isAllowedUrl(url)) {
-            call.reject("url not allowed", "INVALID_URL");
+            call.reject("url not allowed", "INVALID_URL", baseDiag());
             return;
         }
         if (!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
-            call.reject("WebView too old", "UNSUPPORTED");
+            call.reject("WebView too old", "UNSUPPORTED", baseDiag());
             return;
         }
         FetchOp op = new FetchOp();
@@ -122,11 +128,11 @@ public class NhWebFetchPlugin extends Plugin {
         op.timeoutMs = Math.max(5_000, Math.min(call.getInt("timeoutMs", DEFAULT_TIMEOUT_MS), 60_000));
         main.post(() -> {
             if (challengeDialog != null) {
-                call.reject("challenge screen is open", "CHALLENGE_REQUIRED");
+                call.reject("challenge screen is open", "CHALLENGE_REQUIRED", diag(op));
                 return;
             }
             if (!ensureWebView()) {
-                call.reject("no activity", "UNSUPPORTED");
+                call.reject("no activity", "UNSUPPORTED", diag(op));
                 return;
             }
             touch();
@@ -191,7 +197,13 @@ public class NhWebFetchPlugin extends Plugin {
                 return;
             }
             JSONObject p = parseEvalResult(raw);
+            if (p != null) {
+                op.probeHref = p.optString("href");
+                op.probeTitle = p.optString("title");
+            }
             if (isReady(p)) {
+                op.readyTitle = op.probeTitle;
+                op.stage = "fetch";
                 doFetch(op);
                 return;
             }
@@ -254,16 +266,21 @@ public class NhWebFetchPlugin extends Plugin {
             // cookie 過期：重新載入首頁讓 challenge 自動跑一次，再重試
             op.reloaded = true;
             op.loadStarted = true;
+            op.stage = "probe";
             op.readyDeadline = SystemClock.uptimeMillis() + READY_WAIT_MS;
             loadHome();
             main.postDelayed(() -> step(op), POLL_MS);
             return;
         }
         if (challenge) {
-            finishReject(op, "challenge not passed", "CHALLENGE_REQUIRED");
+            JSObject d = diag(op);
+            d.put("status", status);
+            d.put("contentType", contentType);
+            d.put("bodyHead", body.length() > 300 ? body.substring(0, 300) : body);
+            finishReject(op, "challenge not passed (after fetch)", "CHALLENGE_REQUIRED", d);
             return;
         }
-        JSObject ret = new JSObject();
+        JSObject ret = diag(op);
         ret.put("status", status);
         ret.put("contentType", contentType);
         ret.put("body", body);
@@ -273,11 +290,50 @@ public class NhWebFetchPlugin extends Plugin {
     }
 
     private void finishReject(FetchOp op, String message, String code) {
+        finishReject(op, message, code, diag(op));
+    }
+
+    private void finishReject(FetchOp op, String message, String code, JSObject data) {
         if (op.done) return;
         op.done = true;
         if (op.timeout != null) main.removeCallbacks(op.timeout);
-        op.call.reject(message, code);
+        op.call.reject(message, code, data);
         touch();
+    }
+
+    // ---------------------------------------------------------- diagnostics
+
+    /** 不依賴 WebView 實例的資訊（任何執行緒皆可呼叫） */
+    private JSObject baseDiag() {
+        JSObject d = new JSObject();
+        d.put("webMessageListener", WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER));
+        try {
+            PackageInfo pkg = WebViewCompat.getCurrentWebViewPackage(getContext());
+            if (pkg != null) d.put("webViewVersion", pkg.packageName + " " + pkg.versionName);
+        } catch (Exception ignored) {
+            // 取不到版本不影響主流程
+        }
+        return d;
+    }
+
+    /** fetchText 成功／失敗時附上的診斷資訊；只能在主執行緒呼叫 */
+    private JSObject diag(FetchOp op) {
+        JSObject d = baseDiag();
+        String href = "";
+        String title = "";
+        if (webView != null) {
+            href = webView.getUrl() != null ? webView.getUrl() : "";
+            title = webView.getTitle() != null ? webView.getTitle() : "";
+        }
+        d.put("href", href);
+        d.put("title", title);
+        d.put("stage", op.stage);
+        d.put("reloaded", op.reloaded);
+        d.put("probeHref", op.probeHref);
+        d.put("probeTitle", op.probeTitle);
+        d.put("readyTitle", op.readyTitle != null ? op.readyTitle : "");
+        d.put("mainFrameError", mainFrameError);
+        return d;
     }
 
     // -------------------------------------------------------- showChallenge

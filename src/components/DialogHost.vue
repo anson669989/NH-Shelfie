@@ -5,7 +5,13 @@
       <div v-if="d.kind === 'confirm' || d.kind === 'alert'" class="dialog">
         <h3 v-if="d.title">{{ d.title }}</h3>
         <p class="pre">{{ d.message }}</p>
+        <template v-if="d.diagnostics">
+          <h4 class="diag-title">{{ t('settings.diagnostics') }}</h4>
+          <pre class="diag">{{ d.diagnostics }}</pre>
+        </template>
         <div class="dialog-actions">
+          <button v-if="d.diagnostics" class="btn text" @click="copyDiag(d)">{{ t('common.copy') }}</button>
+          <span v-if="d.diagnostics" class="spacer" />
           <button v-if="d.kind === 'confirm'" class="btn text" @click="closeDialog(d, false)">
             {{ t('common.cancel') }}
           </button>
@@ -79,7 +85,7 @@
 </template>
 
 <script setup>
-import { ui, closeDialog } from '../ui.js'
+import { ui, closeDialog, toast } from '../ui.js'
 import { t, errText } from '../i18n.js'
 
 function cancel(d) {
@@ -97,6 +103,15 @@ async function submitPrompt(d) {
     }
   }
   closeDialog(d, d.value)
+}
+
+async function copyDiag(d) {
+  try {
+    await navigator.clipboard.writeText(d.diagnostics)
+    toast(t('common.copiedText'))
+  } catch {
+    toast(t('common.copyFailed'))
+  }
 }
 
 async function runExtra(d) {

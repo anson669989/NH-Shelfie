@@ -16,6 +16,7 @@ import {
   galleryPageUrl,
   showChallenge,
   clearSession,
+  getLastDetailTrace,
 } from './nhSource.js'
 
 const COVERS_DIR = 'covers'
@@ -465,20 +466,30 @@ export async function resetVerification() {
 // ================= 健康檢查 =================
 export async function testConnection() {
   const id = Number.parseInt(settings.test_id, 10) || 177013
-  const result = { detail: null, cover: null }
+  const result = { detail: null, cover: null, diagnostics: null }
+  let coverDiag = null
   try {
     const d = await fetchDetail(id)
     result.detail = 'ok'
     try {
       const res = await downloadCover(id, d.meta, `test/${id}.tmp`)
       result.cover = 'ok'
+      coverDiag = { result: 'ok', mediaId: d.meta.mediaId, ext: d.meta.coverExt }
       await Filesystem.deleteFile({ path: res.path, directory: Directory.Cache }).catch(() => {})
     } catch (err) {
-      result.cover = toAppError(err).cause || toAppError(err).code
+      const e = toAppError(err)
+      result.cover = e.cause || e.code
+      coverDiag = { result: e.code, cause: e.cause ?? null, mediaId: d.meta.mediaId, ext: d.meta.coverExt }
     }
   } catch (err) {
     result.detail = toAppError(err).code
   }
+  // 開發者模式顯示用；只存在這次回傳值，不寫入資料庫
+  result.diagnostics = JSON.stringify(
+    { app: Capacitor.getPlatform(), testId: id, detail: getLastDetailTrace(), cover: coverDiag },
+    null,
+    2,
+  )
   return result
 }
 

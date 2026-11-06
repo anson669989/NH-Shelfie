@@ -308,6 +308,8 @@ async function doTest() {
     const fmt = (v) => (v === 'ok' ? '✓ OK' : `✗ ${errText(new AppError(v))}`)
     await alertDialog(t('settings.testResult', { detail: fmt(r.detail), cover: r.detail === 'ok' ? fmt(r.cover) : '—' }), {
       title: t('settings.testConnection'),
+      // 診斷只在開發者模式顯示（任務 003）
+      diagnostics: devMode.value ? `NH Shelfie ${version.value}\n${r.diagnostics}` : undefined,
     })
   } catch (err) {
     toast(errText(toAppError(err)))
