@@ -7,11 +7,13 @@ import { NhWebFetch } from 'nh-webfetch'
 import { AppError, E } from './errors.js'
 import {
   buildCdnUrl,
+  classifyDownloadError,
   fillTemplate,
   hostOf,
   isApiRetired,
   isChallengePage,
   normalizeCdnServer,
+  orderServers,
   parseCdnConfig,
   parseGallery,
   sniffImageExt,
@@ -507,15 +509,38 @@ async function probeHead(url, ua) {
   }
 }
 
+/** 確保 path 的上層資料夾存在（Filesystem.downloadFile 不會自己建立，會丟 ENOENT）。已存在就略過。 */
+export async function ensureParentDir(path, directory) {
+  const dir = String(path).split('/').slice(0, -1).join('/')
+  if (!dir) return
+  try {
+    await Filesystem.mkdir({ path: dir, directory, recursive: true })
+  } catch (err) {
+    const msg = String(err?.message || err || '')
+    if (/exist/i.test(msg)) return // 資料夾已存在
+    throw new AppError(classifyDownloadError(err) === E.STORAGE_FULL ? E.STORAGE_FULL : E.WRITE_FAILED, {
+      cause: msg.slice(0, TRACE_TEXT_CHARS),
+    })
+  }
+}
+
+// 這些錯誤跟主機無關，換主機也沒用：直接停止輪替（OFFLINE 只有系統回報離線時才停，單一主機連不上仍換下一台）
+const STOP_ROTATION = [E.RATE_LIMITED, E.WRITE_FAILED, E.STORAGE_FULL]
+// 這些錯誤碼原樣丟給呼叫端（介面能說明原因）；其餘包成 COVER_FAILED
+const PASS_THROUGH = [E.RATE_LIMITED, E.WRITE_FAILED, E.STORAGE_FULL, E.OFFLINE]
+
 /**
  * 以原生下載把封面存到快取目錄（不經 base64 橋接），並驗證檔頭與大小。
- * 網址＝CDN 縮圖伺服器 + meta.coverPath（原樣使用，不猜副檔名）。
- * 失敗就依 /api/v2/cdn 的順序換下一台伺服器，直到全部試過；每次之間至少 MIN_INTERVAL。
- * CDN 回 429 視為退避訊號，立即停止。
+ * - 網址＝CDN 縮圖伺服器 + meta.coverPath（原樣使用，不猜副檔名）
+ * - 下載前先建立目標資料夾
+ * - 主機順序：上次成功的主機（cdn_last_host）優先，其餘照 /api/v2/cdn 順序（t1→t2→t3→t4）；
+ *   主機相關的失敗才換下一台，每次之間至少 MIN_INTERVAL；寫檔失敗／空間不足／系統離線／429 立即停止
+ * - 每次嘗試寫到各自的暫存檔（cachePath.<n>），逾時後背景仍在寫的檔案不會蓋到下一次
  * @param {{coverPath:string}} meta
  * @param {string} cachePath 例如 preview/123456.tmp（相對於 Directory.Cache）
  * @param {{diagnose?:boolean}} [opts] diagnose：下載失敗後再發一次 HEAD 取得 HTTP 狀態碼（只給「測試連線」用）
- * @returns {Promise<{path:string, ext:string, url:string}>} 實際格式依檔頭判斷
+ * @returns {Promise<{path:string, ext:string, url:string}>} path 為實際檔案位置；格式依檔頭判斷
+ * @throws {AppError} RATE_LIMITED / WRITE_FAILED / STORAGE_FULL / OFFLINE 原樣丟出；其餘為 COVER_FAILED（cause＝細項）
  */
 export async function downloadCover(galleryId, meta, cachePath, { diagnose = false } = {}) {
   const trace = { galleryId, coverPath: meta?.coverPath ?? null, servers: [], attempts: [], result: null }
@@ -524,23 +549,33 @@ export async function downloadCover(galleryId, meta, cachePath, { diagnose = fal
     trace.result = E.BAD_FORMAT
     throw new AppError(E.COVER_FAILED, { cause: E.BAD_FORMAT })
   }
+  try {
+    await ensureParentDir(cachePath, Directory.Cache)
+  } catch (err) {
+    trace.result = err.code
+    trace.mkdirError = err.cause ?? null
+    log({ gallery_id: galleryId, kind: 'cover', http_status: null, error_code: err.code })
+    throw err
+  }
   let servers
   try {
     servers = await getThumbServers() // 自己會經 schedule()，不可在下方的 schedule 內呼叫（會互等）
   } catch (err) {
     trace.result = `cdn:${errCode(err) || E.UNKNOWN}`
-    if (errCode(err) === E.RATE_LIMITED) throw err
+    if ([E.RATE_LIMITED, E.OFFLINE].includes(errCode(err))) throw err
     throw new AppError(E.COVER_FAILED, { cause: errCode(err) || E.UNKNOWN })
   }
+  servers = orderServers(servers, settings.cdn_last_host)
   trace.servers = [...servers]
   const ua = await appUserAgent()
   trace.userAgent = ua
   return schedule(async () => {
-    let lastErr
+    let lastErr = new AppError(E.COVER_FAILED, { cause: E.UNKNOWN })
     let url = ''
     for (let i = 0; i < servers.length; i++) {
       const step = { host: null, url: null, uaSent: true }
       trace.attempts.push(step)
+      const filePath = `${cachePath}.${i}`
       const startedAt = Date.now()
       try {
         if (i) await sleep(MIN_INTERVAL)
@@ -551,7 +586,7 @@ export async function downloadCover(galleryId, meta, cachePath, { diagnose = fal
         await Promise.race([
           Filesystem.downloadFile({
             url,
-            path: cachePath,
+            path: filePath,
             directory: Directory.Cache,
             recursive: true,
             headers: { 'User-Agent': ua },
@@ -562,36 +597,38 @@ export async function downloadCover(galleryId, meta, cachePath, { diagnose = fal
             throw new AppError(E.TIMEOUT)
           }),
         ])
-        const st = await Filesystem.stat({ path: cachePath, directory: Directory.Cache })
+        const st = await Filesystem.stat({ path: filePath, directory: Directory.Cache })
         step.bytes = st.size ?? null
         if (!st.size || st.size > MAX_COVER_BYTES) throw new AppError(E.COVER_FAILED, { reason: 'size' })
-        const file = await Filesystem.readFile({ path: cachePath, directory: Directory.Cache })
+        const file = await Filesystem.readFile({ path: filePath, directory: Directory.Cache })
         const ext = sniffImageExt(typeof file.data === 'string' ? file.data : new Uint8Array(await file.data.arrayBuffer()))
         if (!ext) throw new AppError(E.COVER_FAILED, { reason: 'not image' })
         step.ok = true
         step.ext = ext
         step.ms = Date.now() - startedAt
         trace.result = 'ok'
+        const origin = new URL(url).origin
+        if (settings.cdn_last_host !== origin) persist('cdn_last_host', origin)
         log({ gallery_id: galleryId, kind: 'cover', http_status: 200, error_code: null })
-        return { path: cachePath, ext, url }
+        return { path: filePath, ext, url }
       } catch (err) {
+        const online = typeof navigator !== 'undefined' ? navigator.onLine : undefined
         step.ms = Date.now() - startedAt
         Object.assign(step, rawErrorInfo(err))
         if (err instanceof AppError) {
           lastErr = err
           if (err.reason) step.reason = err.reason
-        } else if (/\b429\b|Too Many Requests/i.test(String(err?.message || err))) {
-          blockedUntil = Date.now() + 30_000
-          lastErr = new AppError(E.RATE_LIMITED, { httpStatus: 429, retryAfter: 30 })
-        } else if (typeof navigator !== 'undefined' && navigator.onLine === false) {
-          lastErr = new AppError(E.OFFLINE)
         } else {
-          // 不再一律歸成 OFFLINE：原始訊息已記在 step.message / pluginCode
-          lastErr = new AppError(E.COVER_FAILED, { reason: 'download' })
+          const code = classifyDownloadError(err, { online })
+          lastErr = new AppError(code, { cause: step.message ?? null })
+        }
+        if (lastErr.code === E.RATE_LIMITED) {
+          blockedUntil = Date.now() + 30_000
+          lastErr.retryAfter ??= 30
         }
         step.error = lastErr.code
-        await Filesystem.deleteFile({ path: cachePath, directory: Directory.Cache }).catch(() => {})
-        if (lastErr.code === E.RATE_LIMITED) break
+        await Filesystem.deleteFile({ path: filePath, directory: Directory.Cache }).catch(() => {})
+        if (STOP_ROTATION.includes(lastErr.code) || online === false) break
         if (diagnose && step.url) {
           await sleep(MIN_INTERVAL)
           step.probe = await probeHead(step.url, ua)
@@ -605,7 +642,7 @@ export async function downloadCover(galleryId, meta, cachePath, { diagnose = fal
     }
     trace.result = lastErr.code
     log({ gallery_id: galleryId, kind: 'cover', http_status: lastErr.httpStatus ?? null, error_code: lastErr.code })
-    if (lastErr.code === E.RATE_LIMITED) throw lastErr
-    throw new AppError(E.COVER_FAILED, { cause: lastErr.code, url })
+    if (PASS_THROUGH.includes(lastErr.code)) throw Object.assign(lastErr, { url })
+    throw new AppError(E.COVER_FAILED, { cause: lastErr.code === E.COVER_FAILED ? lastErr.reason || 'download' : lastErr.code, url })
   })
 }

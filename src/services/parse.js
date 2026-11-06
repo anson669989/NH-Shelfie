@@ -160,6 +160,39 @@ export function buildCdnUrl(server, coverPath) {
   return `${origin}/${coverPath}`
 }
 
+/**
+ * 封面主機順序：上次成功的主機排第一，其餘照 /api/v2/cdn 的順序（t1→t2→t3→t4）。
+ * preferred 不在清單內就忽略（清單可能已變動）。
+ */
+export function orderServers(servers, preferred) {
+  const list = Array.isArray(servers) ? servers.filter(Boolean) : []
+  const p = preferred ? normalizeCdnServer(preferred) : null
+  if (!p || !list.includes(p)) return list
+  return [p, ...list.filter((s) => s !== p)]
+}
+
+/**
+ * 把原生下載／檔案操作丟出的原始錯誤分類成錯誤碼（不碰網路）。
+ * 順序有意義：寫檔類訊息優先，避免檔案錯誤被當成離線。
+ * @param {any} err 外掛錯誤（取 message）或字串
+ * @param {{online?: boolean}} [env] online === false 代表系統回報離線
+ * @returns {string} E.* 其中之一
+ */
+export function classifyDownloadError(err, { online } = {}) {
+  const msg = String(err?.message ?? err?.errorMessage ?? err ?? '')
+  if (/\b429\b|Too Many Requests/i.test(msg)) return E.RATE_LIMITED
+  if (/ENOSPC|No space left|disk full|SQLITE_FULL/i.test(msg)) return E.STORAGE_FULL
+  if (/ENOENT|No such file or directory|open failed|EACCES|EROFS|EISDIR|Permission denied|Read-only file system|FileNotFound|Unable to (create|write)|Directory does not exist|Parent folder doesn't exist/i.test(msg)) {
+    return E.WRITE_FAILED
+  }
+  if (online === false) return E.OFFLINE
+  if (/time ?out|timed out|SocketTimeout/i.test(msg)) return E.TIMEOUT
+  if (/UnknownHost|Unable to resolve host|ENOTFOUND|ECONNREFUSED|ECONNRESET|ENETUNREACH|Network is unreachable|Failed to connect|Connection (refused|reset)/i.test(msg)) {
+    return E.OFFLINE
+  }
+  return E.COVER_FAILED
+}
+
 /** 舊 API 停用時的回應：403／410 且內文含「Use new API」（不是被 Cloudflare 擋）。 */
 export function isApiRetired({ status, body } = {}) {
   if (status !== 403 && status !== 410) return false

@@ -134,6 +134,7 @@ const zh = {
   'err.ENDPOINT_INVALID': '端點格式不正確（需為 https 且包含必要欄位）',
   'err.CSV_INVALID': 'CSV 檔案無法讀取（需為 UTF-8、5 MB 以內，且有 gallery_id 欄）',
   'err.UNKNOWN': '發生未知錯誤',
+  'err.WRITE_FAILED': '封面存檔失敗（不是網路問題）。請到設定按「清除封面快取」後再試；若仍失敗請回報',
   help: `【新增】到「新增」分頁輸入 gallery ID（或直接貼上 nhentai 網址），按鍵盤「完成」或「查詢」。確認封面與書名後，選擇資料夾（可多選，不選就歸入「未分類」），按「加入收藏」。已收藏的 ID 會顯示黃色提示，不會再次上網。
 
 【分類】在「資料夾」分頁上方切換資料夾；按「＋」新增資料夾，長按資料夾可改名、刪除或調整順序。一本書可以放在多個資料夾。右上角可選擇排序方式，每個資料夾各自記住。
@@ -279,6 +280,7 @@ const en = {
   'err.ENDPOINT_INVALID': 'Invalid endpoint (https and required fields only)',
   'err.CSV_INVALID': 'Cannot read CSV (UTF-8, max 5 MB, needs a gallery_id column)',
   'err.UNKNOWN': 'Unknown error',
+  'err.WRITE_FAILED': 'Couldn’t save the cover file (not a network problem). Tap Clear cover cache in Settings and try again; report it if it keeps failing',
   help: `[Add] In the Add tab, enter a gallery ID (or paste a URL) and press Done or Look up. Check the cover and title, pick folders (multiple allowed; none = Uncategorized), then tap "Add to collection". Saved IDs show a yellow notice without going online.
 
 [Organize] Switch folders at the top of the Folders tab. Tap "+" to create one; long-press a folder to rename, delete or reorder it. A book can be in several folders. Pick a sort order at the top right; each folder remembers its own.
@@ -424,6 +426,7 @@ const ja = {
   'err.ENDPOINT_INVALID': 'エンドポイントが正しくありません（https と必須項目が必要）',
   'err.CSV_INVALID': 'CSV を読み込めません（UTF-8、5 MB 以内、gallery_id 列が必要）',
   'err.UNKNOWN': '不明なエラーが発生しました',
+  'err.WRITE_FAILED': '表紙ファイルを保存できませんでした（ネットワークの問題ではありません）。設定の「表紙キャッシュを削除」を押して再試行し、続く場合は報告してください',
   help: `【追加】「追加」タブで gallery ID を入力（または URL を貼り付け）し、「完了」か「検索」を押します。表紙とタイトルを確認し、フォルダを選んで（複数可、未選択なら未分類）「コレクションに追加」を押します。保存済みの ID は黄色で表示され、通信は行いません。
 
 【整理】「フォルダ」タブ上部でフォルダを切り替えます。「＋」で作成、フォルダを長押しで名前変更・削除・並べ替え。1 冊を複数のフォルダに入れられます。右上で並び順を選べ、フォルダごとに記憶されます。

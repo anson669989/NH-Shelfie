@@ -5,7 +5,7 @@ import { Filesystem, Directory, Encoding } from '@capacitor/filesystem'
 import { Share } from '@capacitor/share'
 import { initDb, query, run, transaction } from './db.js'
 import { AppError, E, toAppError } from './errors.js'
-import { normalizeFolderName, parseGallery } from './parse.js'
+import { classifyDownloadError, normalizeFolderName, parseGallery } from './parse.js'
 import { buildCsv, validateCsv, CSV_MAX_BYTES } from './csv.js'
 import { loadSettings, migrateSettings, setSetting, settings } from './settings.js'
 import {
@@ -70,7 +70,7 @@ export function cacheSrc(path) {
 }
 
 async function clearPreviewCache() {
-  for (const dir of [PREVIEW_DIR, 'refetch', 'test', 'export']) {
+  for (const dir of TEMP_DIRS) {
     await Filesystem.rmdir({ path: dir, directory: Directory.Cache, recursive: true }).catch(() => {})
   }
 }
@@ -161,19 +161,42 @@ export async function lookupGallery(id) {
   if (await getBook(id)) throw new AppError(E.DUPLICATE)
   const detail = await fetchDetail(id)
   let cover = null
+  let coverError = null // 封面失敗原因（錯誤碼），預覽頁顯示白話說明；仍可加入收藏
   try {
     const tmp = `${PREVIEW_DIR}/${id}-${Date.now()}.tmp`
     const res = await downloadCover(id, detail.meta, tmp)
     cover = { cachePath: res.path, ext: res.ext, src: cacheSrc(res.path) }
   } catch (err) {
-    if (toAppError(err).code === E.RATE_LIMITED) throw err
-    cover = null
+    const e = toAppError(err)
+    if (e.code === E.RATE_LIMITED) throw err
+    coverError = e.code === E.COVER_FAILED && e.cause === E.TIMEOUT ? E.TIMEOUT : e.code
   }
-  return { id, ...detail, cover }
+  return { id, ...detail, cover, coverError }
 }
 
-async function moveCacheToCovers(cachePath, id, ext) {
-  const target = `${COVERS_DIR}/${id}.${ext}`
+/** 建立收藏封面資料夾（已存在就略過）。 */
+async function ensureCoversDir() {
+  try {
+    await Filesystem.mkdir({ path: COVERS_DIR, directory: Directory.Data, recursive: true })
+  } catch (err) {
+    const msg = String(err?.message || err || '')
+    if (!/exist/i.test(msg)) throw fileError(err)
+  }
+}
+
+/** 檔案操作錯誤 → STORAGE_FULL 或 WRITE_FAILED（不會變成 OFFLINE） */
+function fileError(err) {
+  const msg = String(err?.message || err || '')
+  return new AppError(classifyDownloadError(err) === E.STORAGE_FULL ? E.STORAGE_FULL : E.WRITE_FAILED, { cause: msg })
+}
+
+/**
+ * 把快取中的封面搬進 covers/。suffix 用於重抓：寫到新檔名，成功後才刪舊檔，
+ * 任何一步失敗都不會讓資料庫指向不存在的檔案。
+ */
+async function moveCacheToCovers(cachePath, id, ext, suffix = '') {
+  await ensureCoversDir()
+  const target = `${COVERS_DIR}/${id}${suffix}.${ext}`
   try {
     await Filesystem.rename({ from: cachePath, to: target, directory: Directory.Cache, toDirectory: Directory.Data })
   } catch {
@@ -181,10 +204,26 @@ async function moveCacheToCovers(cachePath, id, ext) {
       await Filesystem.copy({ from: cachePath, to: target, directory: Directory.Cache, toDirectory: Directory.Data })
       await Filesystem.deleteFile({ path: cachePath, directory: Directory.Cache }).catch(() => {})
     } catch (err) {
-      throw new AppError(E.STORAGE_FULL, { cause: String(err?.message || err) })
+      await Filesystem.deleteFile({ path: cachePath, directory: Directory.Cache }).catch(() => {})
+      throw fileError(err)
     }
   }
   return target
+}
+
+/** 重抓封面成功後：搬到新檔名 → 更新資料庫 → 刪舊檔。 */
+async function replaceCover(id, oldPath, res) {
+  const path = await moveCacheToCovers(res.path, id, res.ext, `-r${Date.now()}`)
+  try {
+    await run(
+      "UPDATE books SET cover_path = ?, cover_ext = ?, cover_rev = cover_rev + 1, fetch_status = 'ok' WHERE gallery_id = ?",
+      [path, res.ext, id],
+    )
+  } catch (err) {
+    await deleteCoverFile(path)
+    throw toAppError(err).code === E.STORAGE_FULL ? toAppError(err) : new AppError(E.DB_FAILED, { cause: String(err) })
+  }
+  if (oldPath && oldPath !== path) await deleteCoverFile(oldPath)
 }
 
 async function deleteCoverFile(path) {
@@ -256,12 +295,7 @@ export async function refetchCover(id) {
   const meta = await coverMetaFor(book)
   const tmp = `refetch/${id}-${Date.now()}.tmp`
   const res = await downloadCover(id, meta, tmp)
-  await deleteCoverFile(book.cover_path)
-  const path = await moveCacheToCovers(res.path, id, res.ext)
-  await run(
-    "UPDATE books SET cover_path = ?, cover_ext = ?, cover_rev = cover_rev + 1, fetch_status = 'ok' WHERE gallery_id = ?",
-    [path, res.ext, id],
-  )
+  await replaceCover(id, book.cover_path, res)
   bump()
 }
 
@@ -414,20 +448,16 @@ export async function runQueue() {
         const fresh = await getBook(book.gallery_id)
         try {
           const res = await downloadCover(book.gallery_id, meta, `refetch/${book.gallery_id}-${Date.now()}.tmp`)
-          await deleteCoverFile(fresh.cover_path)
-          const path = await moveCacheToCovers(res.path, book.gallery_id, res.ext)
-          await run(
-            "UPDATE books SET cover_path = ?, cover_ext = ?, cover_rev = cover_rev + 1, fetch_status = 'ok' WHERE gallery_id = ?",
-            [path, res.ext, book.gallery_id],
-          )
+          await replaceCover(book.gallery_id, fresh.cover_path, res)
         } catch (err) {
           const code = toAppError(err).code
-          if (code === E.RATE_LIMITED) throw err
+          // 跟這本書無關的錯誤（限速、寫檔、空間、離線）：停下佇列，不要把整批書標成無封面
+          if ([E.RATE_LIMITED, E.WRITE_FAILED, E.STORAGE_FULL, E.OFFLINE, E.DB_FAILED].includes(code)) throw err
           await run("UPDATE books SET fetch_status = 'no_cover' WHERE gallery_id = ?", [book.gallery_id])
         }
       } catch (err) {
         const code = toAppError(err).code
-        if ([E.OFFLINE, E.TIMEOUT, E.BLOCKED, E.CHALLENGE, E.RATE_LIMITED, E.STORAGE_FULL].includes(code)) {
+        if ([E.OFFLINE, E.TIMEOUT, E.BLOCKED, E.CHALLENGE, E.RATE_LIMITED, E.STORAGE_FULL, E.WRITE_FAILED, E.DB_FAILED].includes(code)) {
           throw err
         }
         // 查無此書 / 格式不符：不再重試，標為 no_cover（長按可手動重抓）
@@ -519,6 +549,24 @@ export async function coversSize() {
   return { count: files.filter((f) => (typeof f === 'string' ? f : f.name) !== '.nomedia').length, bytes }
 }
 
+const TEMP_DIRS = [PREVIEW_DIR, 'refetch', 'test', 'export']
+
+/** 暫存資料夾（preview/、refetch/、test/、export/）的總大小；收藏封面不算在內。 */
+export async function tempCacheSize() {
+  let bytes = 0
+  let count = 0
+  for (const dir of TEMP_DIRS) {
+    const { files } = await Filesystem.readdir({ path: dir, directory: Directory.Cache }).catch(() => ({ files: [] }))
+    for (const f of files) {
+      if (typeof f === 'string' || f.type === 'directory') continue
+      count++
+      bytes += Number(f.size) || 0
+    }
+  }
+  return { count, bytes }
+}
+
+/** 「清除封面快取」：只清暫存資料夾，收藏封面不刪。 */
 export async function clearTempCache() {
   await clearPreviewCache()
 }
