@@ -6,7 +6,7 @@
 
 <h1 align="center">NH Shelfie</h1>
 
-<p align="center">Your own bookshelf on your phone: save galleries by ID, sort them into folders — no account, nothing uploaded.</p>
+<p align="center">Your own nhentai bookshelf on your phone: save galleries by ID, sort them into folders — no account, nothing uploaded.</p>
 
 <p align="center">
   <a href="https://github.com/anson669989/NH-Shelfie/releases/latest"><img src="https://img.shields.io/github/v/release/anson669989/NH-Shelfie?label=version" alt="Version"></a>
