@@ -6,7 +6,7 @@
 
 <h1 align="center">NH Shelfie</h1>
 
-<p align="center">把喜歡的本子收進自己的手機書架：輸入 ID 就收藏，用資料夾分類，不用帳號、不上傳任何資料。</p>
+<p align="center">自訂義收藏nhentai本子：輸入 ID 就收藏，用資料夾分類，不用帳號、不上傳任何資料。</p>
 
 <p align="center">
   <a href="https://github.com/anson669989/NH-Shelfie/releases/latest"><img src="https://img.shields.io/github/v/release/anson669989/NH-Shelfie?label=%E7%89%88%E6%9C%AC" alt="版本"></a>
