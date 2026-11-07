@@ -31,16 +31,16 @@
 - 🌏 **四種語言**：繁體中文、简体中文、English、日本語。
 - 💾 **資料可匯出備份**：匯出 CSV，換手機一鍵匯入。
 
-<!-- 截圖區：放好圖片後移除註解（docs/screenshots/library.png、add.png、settings.png）
-## 📱 截圖
+
+## 📱 頁面
 
 <p align="center">
-  <img src="docs/screenshots/library.png" width="30%" alt="收藏頁">
-  <img src="docs/screenshots/add.png" width="30%" alt="加入頁">
-  <img src="docs/screenshots/settings.png" width="30%" alt="設定頁">
+  <img src="docs/screenshots/library.jpg" width="30%" alt="收藏頁">
+  <img src="docs/screenshots/add.jpg" width="30%" alt="加入頁">
+  <img src="docs/screenshots/settings.jpg" width="30%" alt="設定頁">
 </p>
 <p align="center">收藏頁　·　加入頁　·　設定頁</p>
--->
+
 
 ## 🚀 快速上手
 

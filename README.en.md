@@ -31,16 +31,16 @@
 - 🌏 **Four languages**: 繁體中文, 简体中文, English, 日本語.
 - 💾 **Export for backup**: export a CSV and import it on a new phone.
 
-<!-- Screenshots: remove this comment once the images are in place (docs/screenshots/library.png, add.png, settings.png)
+
 ## 📱 Screenshots
 
 <p align="center">
-  <img src="docs/screenshots/library.png" width="30%" alt="Library">
-  <img src="docs/screenshots/add.png" width="30%" alt="Add">
-  <img src="docs/screenshots/settings.png" width="30%" alt="Settings">
+  <img src="docs/screenshots/library.jpg" width="30%" alt="Library">
+  <img src="docs/screenshots/add.jpg" width="30%" alt="Add">
+  <img src="docs/screenshots/settings.jpg" width="30%" alt="Settings">
 </p>
 <p align="center">Library · Add · Settings</p>
--->
+
 
 ## 🚀 Quick start
 
